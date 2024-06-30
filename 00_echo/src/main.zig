@@ -4,50 +4,39 @@ const posix = std.posix;
 pub fn main() !void {
     const allocator = std.heap.page_allocator;
 
-    const addressList = try std.net.getAddressList(allocator, "0.0.0.0", 3491);
-    defer addressList.deinit();
-    std.debug.print("Got addressList, {any}!\n", .{addressList.addrs});
+    const address = try std.net.Address.parseIp4("0.0.0.0", 3491);
+    std.debug.print("Address: {any}\n", .{address});
 
-    const myAddress = addressList.addrs[0];
-    const mySocket = try posix.socket(myAddress.in.sa.family, posix.SOCK.STREAM, 0);
-    defer posix.close(mySocket);
-
-    try posix.setsockopt(mySocket, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-
-    std.debug.print("Got socket, {any}!\n", .{mySocket});
-    try posix.bind(mySocket, &myAddress.any, myAddress.getOsSockLen());
-    std.debug.print("Bound!\n", .{});
-    // try posix.connect(mySocket, &myAddress.any, myAddress.getOsSockLen());
-    std.debug.print("Connected! {any} {any}\n", .{ mySocket, 10 });
-    try posix.listen(mySocket, 5);
-    std.debug.print("Listening...\n", .{});
+    var server = try address.listen(.{ .reuse_address = true, .reuse_port = true });
+    defer server.deinit();
+    std.debug.print("server: {any}\n", .{server});
 
     while (true) {
-        var remoteAddress: std.net.Address = undefined;
-        var addressSize = myAddress.getOsSockLen();
-        const connectionSocket = try posix.accept(mySocket, &remoteAddress.any, &addressSize, 0);
-        defer posix.close(connectionSocket);
-        std.debug.print("Got request from {any} with socket {any}!\n", .{ remoteAddress, connectionSocket });
+        std.debug.print("waiting for connection...\n", .{});
+        const connection = try server.accept();
+        defer connection.stream.close();
+        std.debug.print("stream: {any}\n", .{connection});
 
         var data = std.ArrayList(u8).init(allocator);
         defer data.deinit();
         var smallBuf: [1024]u8 = undefined;
         while (true) {
-            const nBytesReceived = try posix.recv(connectionSocket, &smallBuf, 0);
+            std.debug.print("Waiting to read...\n", .{});
+            const nBytesReceived = try connection.stream.read(&smallBuf);
             if (nBytesReceived <= 0) {
                 break;
             }
             std.debug.print("Got {any} bytes: {s}\n", .{ nBytesReceived, smallBuf });
 
             try data.appendSlice(smallBuf[0..nBytesReceived]);
+            std.debug.print("Appended, last byte is {any}\n", .{smallBuf[nBytesReceived - 1]});
             if (smallBuf[nBytesReceived - 1] < 0) { // EOF
                 break;
             }
         }
-        var bytesSent: usize = 0;
-        while (bytesSent < data.items.len) {
-            bytesSent += try posix.send(connectionSocket, data.items[bytesSent..data.items.len], 0);
-        }
+        std.debug.print("Sending bytes...\n", .{});
+        try connection.stream.writeAll(data.items);
+        std.debug.print("Bytes sent\n", .{});
     }
 }
 
