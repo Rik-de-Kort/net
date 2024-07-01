@@ -65,41 +65,46 @@ pub fn main() !void {
         connection_loop: while (true) {
             std.debug.print("stream: {any}\n", .{connection});
 
-            var data = std.ArrayList(u8).init(allocator);
+            var data = std.ArrayList(u8).init(allocator); // All data received for this session
             defer data.deinit();
-            var smallBuf: [39]u8 = undefined;
-            var lastChar: u8 = undefined;
-            // This doesn't work yet: client can send multiple messages, we would like to process them one at a time
-            // If we know the size of a message (should be always the same since 64 bits for the number, rest is const)
-            // Except sometimes a message can be only 38 bytes long??
-            std.debug.print("Waiting to read...\n", .{});
-            const nBytesReceived = try connection.stream.read(&smallBuf);
-            if (nBytesReceived <= 0) {
-                break;
-            }
-            std.debug.print("Got {any} bytes: {s}\n", .{ nBytesReceived, smallBuf });
-            std.debug.print("as bytes {any}\n", .{smallBuf});
 
-            try data.appendSlice(smallBuf[0..nBytesReceived]);
-            std.debug.print("Appended, last byte is {any}\n", .{smallBuf[nBytesReceived - 1]});
-            lastChar = smallBuf[nBytesReceived - 1];
-            if (lastChar != 10) {
-                break :connection_loop;
-            }
+            var i: usize = 0; // Start of current message
+            var receiveBuf: [64]u8 = undefined;
 
-            std.debug.print("Handling input {s}\n", .{data.items});
-            const result = handle(allocator, data.items) catch {
-                std.debug.print("Malformed input, continuing\n", .{});
-                break :connection_loop;
-            };
-            defer result.deinit();
+            read_and_handle: while (true) {
+                std.debug.print("Waiting to read...\n", .{});
+                const nBytesReceived = try connection.stream.read(&receiveBuf);
+                if (nBytesReceived <= 0) {
+                    break :read_and_handle;
+                }
+                std.debug.print("Got {any} bytes: {s}\n", .{ nBytesReceived, receiveBuf });
+                std.debug.print("as bytes {any}\n", .{receiveBuf});
 
-            std.debug.print("Sending bytes {s}\n", .{result.items});
-            std.debug.print("Sending bytes (as bytes) {any}\n", .{result.items});
-            try connection.stream.writeAll(result.items);
-            std.debug.print("Bytes sent\n", .{});
-            if (lastChar < 0) {
-                break :connection_loop;
+                try data.appendSlice(receiveBuf[0..nBytesReceived]);
+
+                var j = i; // Index of \n (end of message)
+                while (j < data.items.len) : (j += 1) {
+                    if (data.items[j] == 10) {
+                        break;
+                    }
+                } else { // No \n found, fetch more data
+                    continue :read_and_handle;
+                }
+
+                const inputMsg = data.items[i..j];
+                std.debug.print("Handling input {s}\n", .{inputMsg});
+                const result = handle(allocator, inputMsg) catch {
+                    std.debug.print("Malformed input, continuing\n", .{});
+                    break :connection_loop;
+                };
+                defer result.deinit();
+
+                std.debug.print("Sending bytes {s}\n", .{result.items});
+                std.debug.print("Sending bytes (as bytes) {any}\n", .{result.items});
+                try connection.stream.writeAll(result.items);
+                std.debug.print("Bytes sent\n", .{});
+
+                i = j + 1; // j is index of \n, add one to get start of new message
             }
         }
     }
