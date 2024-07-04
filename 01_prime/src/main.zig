@@ -161,15 +161,82 @@ test "string equal method" {
     try expect(!stringEql("primeis", "isPrime"));
 }
 
-test "json strictness" {
-    const brackets = "{\"method\":\"isPrime\",\"number\":[5337857]}";
-    try std.testing.expectError(error.UnexpectedToken, std.json.parseFromSlice(PrimeInput, std.testing.allocator, brackets, .{}));
-    const noMethod = "{\"number\":5337857}";
-    try std.testing.expectError(error.MissingField, std.json.parseFromSlice(PrimeInput, std.testing.allocator, noMethod, .{}));
-    const illegalQuotes = "{\"method\":\"isPrime\",\"number\":\"1389564\"}";
+const ParseError = error{ParseError};
 
-    const result = try std.json.parseFromSlice(PrimeInput, std.testing.allocator, illegalQuotes, .{});
-    defer result.deinit();
-    // const wrongMethod = "{\"method\":\"primeis\",\"number\":5337857}";
-    // try std.testing.expectError(error.WrongMethod, std.json.parseFromSlice(PrimeInput, std.testing.allocator, wrongMethod, .{}));
+const Parser = struct {
+    allocator: std.mem.Allocator,
+    input: []const u8,
+    position: usize = 0,
+
+    pub fn expect(self: Parser, bytes: []const u8) ParseError!void {
+        const end = self.position + bytes.len;
+        if (!std.mem.eql(self.input[self.position..end], bytes)) {
+            return ParseError;
+        }
+        self.position = end;
+    }
+
+    pub fn expectQuotedString(self: Parser) ParseError![]const u8 {
+        try self.expect("\"");
+        var result = std.ArrayList(u8).init(self.allocator);
+        var end = self.position;
+        while (end < self.input.len and !std.mem.eql(self.input[end], "\"")) : (end += 1) {}
+        try result.appendSlice(self.input[self.position..end]);
+        try self.expect(result.items);
+        try self.expect("\"");
+    }
+
+    pub fn expectNumber(self: Parser) ParseError![]f64 {
+        // Todo
+        _ = self;
+        return ParseError;
+    }
+
+    pub fn expectEnd(self: Parser) ParseError!void {
+        if (self.position + 1 < self.input.len) {
+            return ParseError;
+        }
+    }
+};
+
+fn parseInput(allocator: std.mem.Allocator, input: []const u8) ParseError!PrimeInput {
+    _ = allocator;
+    var parser = Parser{ .input = input };
+    try parser.expect("{");
+    var num: f64 = undefined;
+    const field = try parser.expectQuotedString();
+    if (std.mem.eql(field, "method")) {
+        try parser.expect(":");
+        try parser.expect("isPrime");
+        try parser.expect(",");
+        try parser.expect("\"number\":");
+        num = try parser.expectNumber();
+        try parser.expect("}");
+        try parser.expectEnd();
+    } else if (std.mem.eql(field, "number")) {
+        try parser.expect(":");
+        num = parser.expectNumber();
+        try parser.expect(",");
+        try parser.expect("\"method\":\"isPrime\"}");
+        try parser.expectEnd();
+    } else {
+        return ParseError;
+    }
+    return PrimeInput{ .method = "isPrime", .number = num };
+}
+
+test "json strictness" {
+    const allocator = std.testing.allocator;
+
+    const brackets = "{\"method\":\"isPrime\",\"number\":[5337857]}";
+    try std.testing.expectError(ParseError, parseInput(allocator, brackets));
+
+    const noMethod = "{\"number\":5337857}";
+    try std.testing.expectError(ParseError, parseInput(allocator, noMethod));
+
+    const illegalQuotes = "{\"method\":\"isPrime\",\"number\":\"1389564\"}";
+    try std.testing.expectError(ParseError, parseInput(allocator, illegalQuotes));
+
+    const wrongMethod = "{\"method\":\"primeis\",\"number\":5337857}";
+    try std.testing.expectError(ParseError, parseInput(allocator, wrongMethod));
 }
