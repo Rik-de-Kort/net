@@ -164,79 +164,118 @@ test "string equal method" {
 const ParseError = error{ParseError};
 
 const Parser = struct {
-    allocator: std.mem.Allocator,
     input: []const u8,
     position: usize = 0,
 
-    pub fn expect(self: Parser, bytes: []const u8) ParseError!void {
+    pub fn expect(self: *Parser, bytes: []const u8) ParseError!void {
         const end = self.position + bytes.len;
-        if (!std.mem.eql(self.input[self.position..end], bytes)) {
-            return ParseError;
+        if (!std.mem.eql(u8, self.input[self.position..end], bytes)) {
+            std.debug.print("Expected {s} got {s}\n", .{ bytes, self.input[self.position..end] });
+            return error.ParseError;
         }
         self.position = end;
     }
 
-    pub fn expectQuotedString(self: Parser) ParseError![]const u8 {
+    pub fn expectQuotedString(self: *Parser) ParseError![]const u8 {
         try self.expect("\"");
-        var result = std.ArrayList(u8).init(self.allocator);
         var end = self.position;
-        while (end < self.input.len and !std.mem.eql(self.input[end], "\"")) : (end += 1) {}
-        try result.appendSlice(self.input[self.position..end]);
-        try self.expect(result.items);
+        while (end < self.input.len and self.input[end] != '"') : (end += 1) {}
+        const result = self.input[self.position..end];
+        try self.expect(result);
         try self.expect("\"");
+        return result;
     }
 
-    pub fn expectNumber(self: Parser) ParseError![]f64 {
-        // Todo
-        _ = self;
-        return ParseError;
+    pub fn expectNumber(self: *Parser) ParseError!f64 {
+        const start = self.position;
+
+        var seen_dot = false;
+        var seen_e = false;
+
+        while (self.position < self.input.len) : (self.position += 1) {
+            const current_char = self.input[self.position];
+            if (current_char == '.') {
+                if (seen_dot or seen_e) { // Dot not allowed after e
+                    return error.ParseError;
+                } else {
+                    seen_dot = true;
+                }
+            } else if (current_char == 'e') {
+                if (seen_e) {
+                    return error.ParseError;
+                } else {
+                    seen_e = true;
+                }
+            } else if (!std.ascii.isDigit(current_char)) {
+                break;
+            }
+        } else {
+            return error.ParseError;
+        }
+
+        self.position += 1; // Final add because we broke the loop
+
+        const to_parse = self.input[start..self.position];
+        std.debug.print("Trying to parse a float out of {s}\n", .{to_parse});
+
+        const result: f64 = std.fmt.parseFloat(f64, to_parse) catch blk: {
+            const parsedInt = std.fmt.parseInt(u64, to_parse, 10) catch return error.ParseError;
+            const intAsFloat: f64 = @floatFromInt(parsedInt);
+            break :blk intAsFloat;
+        };
+        return result;
     }
 
     pub fn expectEnd(self: Parser) ParseError!void {
         if (self.position + 1 < self.input.len) {
-            return ParseError;
+            return error.ParseError;
         }
     }
 };
 
-fn parseInput(allocator: std.mem.Allocator, input: []const u8) ParseError!PrimeInput {
-    _ = allocator;
+fn parseInput(input: []const u8) ParseError!PrimeInput {
     var parser = Parser{ .input = input };
     try parser.expect("{");
     var num: f64 = undefined;
     const field = try parser.expectQuotedString();
-    if (std.mem.eql(field, "method")) {
+    if (std.mem.eql(u8, field, "method")) {
         try parser.expect(":");
-        try parser.expect("isPrime");
+        try parser.expect("\"isPrime\"");
         try parser.expect(",");
         try parser.expect("\"number\":");
         num = try parser.expectNumber();
         try parser.expect("}");
         try parser.expectEnd();
-    } else if (std.mem.eql(field, "number")) {
+    } else if (std.mem.eql(u8, field, "number")) {
         try parser.expect(":");
-        num = parser.expectNumber();
+        num = try parser.expectNumber();
         try parser.expect(",");
         try parser.expect("\"method\":\"isPrime\"}");
         try parser.expectEnd();
     } else {
-        return ParseError;
+        return error.ParseError;
     }
     return PrimeInput{ .method = "isPrime", .number = num };
 }
 
 test "json strictness" {
-    const allocator = std.testing.allocator;
+    _ = try (std.fmt.parseFloat(f64, "5337857") catch std.fmt.parseInt(f64, "5337857", 10));
+
+    var parser = Parser{ .input = "5337857" };
+    _ = try parser.expectNumber();
+
+    const good = "{\"method\":\"isPrime\",\"number\":5337857}";
+    _ = try parseInput(good);
 
     const brackets = "{\"method\":\"isPrime\",\"number\":[5337857]}";
-    try std.testing.expectError(ParseError, parseInput(allocator, brackets));
+    try std.testing.expectError(error.ParseError, parseInput(brackets));
 
     const noMethod = "{\"number\":5337857}";
-    try std.testing.expectError(ParseError, parseInput(allocator, noMethod));
+    try std.testing.expectError(error.ParseError, parseInput(noMethod));
 
     const illegalQuotes = "{\"method\":\"isPrime\",\"number\":\"1389564\"}";
-    try std.testing.expectError(ParseError, parseInput(allocator, illegalQuotes));
+    try std.testing.expectError(error.ParseError, parseInput(illegalQuotes));
 
     const wrongMethod = "{\"method\":\"primeis\",\"number\":5337857}";
-    try std.testing.expectError(ParseError, parseInput(allocator, wrongMethod));
+    try std.testing.expectError(error.ParseError, parseInput(wrongMethod));
 }
