@@ -11,31 +11,25 @@ pub fn stringEql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-const PrimeInput = struct { method: *const [7]u8, number: f64 };
+const PrimeInput = struct { method: *const [7]u8, number: i128 };
 
-fn isPrime(x: f64) bool {
-    if (x < 0) {
+fn isPrime(n: i128) bool {
+    if (n < 0) {
         return false;
     }
-    const floored: f64 = @divFloor(x, 1);
-    if (floored != x) {
-        return false;
-    }
-
-    const n: u64 = @intFromFloat(x);
     if (n == 1) {
         return false;
     }
     if (n == 2) {
         return true;
     }
-    if (n % 2 == 0) {
+    if (@mod(n, 2) == 0) {
         return false;
     }
 
-    var i: u64 = 3;
+    var i: i128 = 3;
     while (i * i <= n) : (i += 2) {
-        if (n % i == 0) {
+        if (@mod(n, i) == 0) {
             return false;
         }
     }
@@ -43,28 +37,24 @@ fn isPrime(x: f64) bool {
 }
 
 fn handle(allocator: std.mem.Allocator, msg: []u8) !std.ArrayList(u8) {
-    // Todo: hand-roll parser
-    const parsed = try std.json.parseFromSlice(
-        PrimeInput,
-        allocator,
-        msg,
-        .{},
-    );
-    defer parsed.deinit();
+    const parsed = try parseInput(msg);
 
-    std.debug.print("Got method {s}\n", .{parsed.value.method});
-    if (!stringEql(parsed.value.method, "isPrime")) {
+    std.debug.print("Got method {s}\n", .{parsed.method});
+    if (!stringEql(parsed.method, "isPrime")) {
         return error.WrongMethod;
     }
 
-    std.debug.print("Parsed {any}\n", .{parsed.value});
+    std.debug.print("Parsed {any}\n", .{parsed});
     var result = std.ArrayList(u8).init(allocator);
-    try std.json.stringify(.{ .method = "isPrime", .prime = isPrime(parsed.value.number) }, .{}, result.writer());
-    try result.append(10);
+    try std.json.stringify(.{ .method = "isPrime", .prime = isPrime(parsed.number) }, .{}, result.writer());
+    try result.append('\n');
     return result;
 }
 
 pub fn main() !void {
+    var parser = Parser{ .input = "5337857" };
+    _ = try parser.expectNumber();
+
     const allocator = std.heap.page_allocator;
 
     const wrongMethod = "{\"method\":\"primeis\",\"number\":5337857}";
@@ -169,6 +159,9 @@ const Parser = struct {
 
     pub fn expect(self: *Parser, bytes: []const u8) ParseError!void {
         const end = self.position + bytes.len;
+        if (end > self.input.len) {
+            return error.ParseError;
+        }
         if (!std.mem.eql(u8, self.input[self.position..end], bytes)) {
             std.debug.print("Expected {s} got {s}\n", .{ bytes, self.input[self.position..end] });
             return error.ParseError;
@@ -186,13 +179,17 @@ const Parser = struct {
         return result;
     }
 
-    pub fn expectNumber(self: *Parser) ParseError!f64 {
+    pub fn expectNumber(self: *Parser) ParseError!i128 {
         const start = self.position;
+
+        if (self.input[self.position] == '-') {
+            self.position += 1;
+        }
 
         var seen_dot = false;
         var seen_e = false;
 
-        while (self.position < self.input.len) : (self.position += 1) {
+        while (self.position < self.input.len - 1) : (self.position += 1) {
             const current_char = self.input[self.position];
             if (current_char == '.') {
                 if (seen_dot or seen_e) { // Dot not allowed after e
@@ -207,23 +204,16 @@ const Parser = struct {
                     seen_e = true;
                 }
             } else if (!std.ascii.isDigit(current_char)) {
+                // self.position += 1; // Final add because we are breaking the loop
                 break;
             }
-        } else {
-            return error.ParseError;
         }
-
-        self.position += 1; // Final add because we broke the loop
 
         const to_parse = self.input[start..self.position];
         std.debug.print("Trying to parse a float out of {s}\n", .{to_parse});
 
-        const result: f64 = std.fmt.parseFloat(f64, to_parse) catch blk: {
-            const parsedInt = std.fmt.parseInt(u64, to_parse, 10) catch return error.ParseError;
-            const intAsFloat: f64 = @floatFromInt(parsedInt);
-            break :blk intAsFloat;
-        };
-        return result;
+        _ = std.fmt.parseFloat(f64, to_parse) catch return error.ParseError;
+        return std.fmt.parseInt(i128, to_parse, 10) catch return 4;
     }
 
     pub fn expectEnd(self: Parser) ParseError!void {
@@ -236,36 +226,39 @@ const Parser = struct {
 fn parseInput(input: []const u8) ParseError!PrimeInput {
     var parser = Parser{ .input = input };
     try parser.expect("{");
-    var num: f64 = undefined;
-    const field = try parser.expectQuotedString();
-    if (std.mem.eql(u8, field, "method")) {
-        try parser.expect(":");
-        try parser.expect("\"isPrime\"");
-        try parser.expect(",");
-        try parser.expect("\"number\":");
-        num = try parser.expectNumber();
-        try parser.expect("}");
-        try parser.expectEnd();
-    } else if (std.mem.eql(u8, field, "number")) {
-        try parser.expect(":");
-        num = try parser.expectNumber();
-        try parser.expect(",");
-        try parser.expect("\"method\":\"isPrime\"}");
-        try parser.expectEnd();
-    } else {
+    var seen_method = false;
+    var seen_number = false;
+    var num: i128 = undefined;
+    while (parser.position < parser.input.len) {
+        const field = try parser.expectQuotedString();
+        if (std.mem.eql(u8, field, "method")) {
+            try parser.expect(":");
+            try parser.expect("\"isPrime\"");
+            seen_method = true;
+        } else if (std.mem.eql(u8, field, "number")) {
+            try parser.expect(":");
+            num = try parser.expectNumber();
+            seen_number = true;
+        } else {
+            while (parser.position < parser.input.len and parser.input[parser.position] != ',' and parser.input[parser.position] != '}') : (parser.position += 1) {}
+        }
+        parser.expect(",") catch break;
+    }
+    if (!seen_number or !seen_method) {
         return error.ParseError;
     }
+    std.debug.print("{s}, {any}, {any}\n", .{ parser.input, parser.position, parser.input.len });
+    try parser.expect("}");
+    try parser.expectEnd();
     return PrimeInput{ .method = "isPrime", .number = num };
 }
 
 test "json strictness" {
-    _ = try (std.fmt.parseFloat(f64, "5337857") catch std.fmt.parseInt(f64, "5337857", 10));
-
-    var parser = Parser{ .input = "5337857" };
-    _ = try parser.expectNumber();
-
     const good = "{\"method\":\"isPrime\",\"number\":5337857}";
     _ = try parseInput(good);
+
+    const comment = "{\"method\":\"isPrime\",\"number\":5337857,\"comment\":\"wow zig is so cool\"}";
+    _ = try parseInput(comment);
 
     const brackets = "{\"method\":\"isPrime\",\"number\":[5337857]}";
     try std.testing.expectError(error.ParseError, parseInput(brackets));
