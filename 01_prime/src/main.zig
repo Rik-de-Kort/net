@@ -11,8 +11,6 @@ pub fn stringEql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-const PrimeInput = struct { method: *const [7]u8, number: i128 };
-
 fn isPrime(n: i128) bool {
     if (n < 0) {
         return false;
@@ -37,7 +35,7 @@ fn isPrime(n: i128) bool {
 }
 
 fn handle(allocator: std.mem.Allocator, msg: []u8) !std.ArrayList(u8) {
-    const parsed = try parseInput(msg);
+    const parsed = try parseInput(allocator, msg);
 
     std.debug.print("Got method {s}\n", .{parsed.method});
     if (!stringEql(parsed.method, "isPrime")) {
@@ -52,9 +50,6 @@ fn handle(allocator: std.mem.Allocator, msg: []u8) !std.ArrayList(u8) {
 }
 
 pub fn main() !void {
-    var parser = Parser{ .input = "5337857" };
-    _ = try parser.expectNumber();
-
     const allocator = std.heap.page_allocator;
 
     const wrongMethod = "{\"method\":\"primeis\",\"number\":5337857}";
@@ -138,7 +133,6 @@ pub fn main() !void {
 const expect = std.testing.expect;
 
 test "isprime function" {
-    try expect(!isPrime(3.4));
     try expect(isPrime(3));
     try expect(!isPrime(4));
     try expect(!isPrime(121));
@@ -171,8 +165,11 @@ const Parser = struct {
 
     pub fn expectQuotedString(self: *Parser) ParseError![]const u8 {
         try self.expect("\"");
+        var escaped = false;
         var end = self.position;
-        while (end < self.input.len and self.input[end] != '"') : (end += 1) {}
+        while (end < self.input.len and (escaped or self.input[end] != '"')) : (end += 1) {
+            escaped = !escaped and self.input[end] == '\\'; // If previous char was \, then this \ is escaped and doesn't count
+        }
         const result = self.input[self.position..end];
         try self.expect(result);
         try self.expect("\"");
@@ -223,7 +220,7 @@ const Parser = struct {
     }
 };
 
-fn parseInput(input: []const u8) ParseError!PrimeInput {
+fn parseInput(allocator: std.mem.Allocator, input: []const u8) (error{OutOfMemory} || ParseError)!PrimeInput {
     var parser = Parser{ .input = input };
     try parser.expect("{");
     var seen_method = false;
@@ -240,7 +237,54 @@ fn parseInput(input: []const u8) ParseError!PrimeInput {
             num = try parser.expectNumber();
             seen_number = true;
         } else {
-            while (parser.position < parser.input.len and parser.input[parser.position] != ',' and parser.input[parser.position] != '}') : (parser.position += 1) {}
+            try parser.expect(":");
+
+            var stack = try std.ArrayList(u8).initCapacity(allocator, 10);
+            defer stack.deinit();
+
+            var scanning_string = false;
+            var escaped = false;
+            std.debug.print("scanning misc field {s}\n", .{parser.input[parser.position..]});
+
+            // Todo: rewrite this using while loop with expect.
+            for (parser.input[parser.position..]) |current_char| {
+                // std.debug.print("{c} {any} {any} {s}\n", .{ current_char, parser.position, scanning_string, stack.items });
+                parser.position += 1;
+
+                if (scanning_string) {
+                    if (!escaped and current_char == '"') {
+                        scanning_string = false;
+                        escaped = false;
+                    } else {
+                        // If previous char was \ and this char is \, then the next char is not escaped!
+                        escaped = !escaped and current_char == '\\';
+                    }
+                    continue;
+                }
+
+                switch (current_char) {
+                    '[' => try stack.append(current_char),
+                    ']' => if (stack.items.len == 0 or stack.pop() != '[') {
+                        return error.ParseError; // Mismatched closing bracket
+                    },
+                    '{' => try stack.append(current_char),
+                    '}' => if (stack.items.len == 0) { // Fell off the end
+                        parser.position -= 1;
+                        std.debug.print("Found }} with empty stack, position {any}", .{parser.position});
+                        break;
+                    } else if (stack.pop() != '{') {
+                        return error.ParseError; // Mismatched closing brace
+                    },
+                    '"' => scanning_string = true, // scanning_string is done above this switch so always set to true
+                    ',' => if (stack.items.len == 0) {
+                        parser.position -= 1;
+                        std.debug.print("Found , with empty stack, position {any}", .{parser.position});
+                        break;
+                    },
+                    else => {},
+                }
+            }
+            std.debug.print("\nFell off the for loop at {any}\n", .{parser.position});
         }
         parser.expect(",") catch break;
     }
@@ -253,22 +297,43 @@ fn parseInput(input: []const u8) ParseError!PrimeInput {
     return PrimeInput{ .method = "isPrime", .number = num };
 }
 
+const PrimeInput = struct { method: *const [7]u8, number: i128 };
+
+test "builtin json" {
+    const illegal_quotes = "{\"method\":\"isPrime\",\"number\":\"1389564\"}";
+    const result = try std.json.parseFromSlice(PrimeInput, std.testing.allocator, illegal_quotes, .{});
+    result.deinit();
+}
+
+test "builtin json2" {
+    const illegal_quotes = "{\"method\":\"isPrime\",\"number\":\"1rerere564\"}";
+    try std.testing.expectError(error.InvalidCharacter, std.json.parseFromSlice(PrimeInput, std.testing.allocator, illegal_quotes, .{}));
+}
+
 test "json strictness" {
+    const allocator = std.testing.allocator;
+
     const good = "{\"method\":\"isPrime\",\"number\":5337857}";
-    _ = try parseInput(good);
+    _ = try parseInput(allocator, good);
+
+    const good_with_object = "{\"method\":\"isPrime\",\"ignore\":{\"method\":\"isPrime\",\"number\":\"61097353\"},\"number\":5296481}";
+    _ = try parseInput(allocator, good_with_object);
+
+    const good_with_escape = "{\"method\":\"isPrime\",\"not\\\"method\":\"isntPrime\",\"number\":3525720}";
+    _ = try parseInput(allocator, good_with_escape);
 
     const comment = "{\"method\":\"isPrime\",\"number\":5337857,\"comment\":\"wow zig is so cool\"}";
-    _ = try parseInput(comment);
+    _ = try parseInput(allocator, comment);
 
     const brackets = "{\"method\":\"isPrime\",\"number\":[5337857]}";
-    try std.testing.expectError(error.ParseError, parseInput(brackets));
+    try std.testing.expectError(error.ParseError, parseInput(allocator, brackets));
 
     const noMethod = "{\"number\":5337857}";
-    try std.testing.expectError(error.ParseError, parseInput(noMethod));
+    try std.testing.expectError(error.ParseError, parseInput(allocator, noMethod));
 
     const illegalQuotes = "{\"method\":\"isPrime\",\"number\":\"1389564\"}";
-    try std.testing.expectError(error.ParseError, parseInput(illegalQuotes));
+    try std.testing.expectError(error.ParseError, parseInput(allocator, illegalQuotes));
 
     const wrongMethod = "{\"method\":\"primeis\",\"number\":5337857}";
-    try std.testing.expectError(error.ParseError, parseInput(wrongMethod));
+    try std.testing.expectError(error.ParseError, parseInput(allocator, wrongMethod));
 }
