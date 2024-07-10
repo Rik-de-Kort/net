@@ -1,8 +1,23 @@
 const std = @import("std");
 
-fn parse_network_int(bytes: [4]u8) i32 {
-    const i: i32 = @bitCast(bytes);
-    return @bitReverse(i);
+fn read_network_int(bytes: [4]u8) i32 {
+    return @bitCast([_]u8{ bytes[3], bytes[2], bytes[1], bytes[0] });
+}
+
+test "read_network_int" {
+    try std.testing.expectEqual(read_network_int("\x00\x00\x03\xe8".*), 1000);
+    try std.testing.expectEqual(read_network_int("\x00\x00\x30\x39".*), 12345);
+}
+
+fn write_network_int(i: i32) [4]u8 {
+    const bytes = @constCast(std.mem.asBytes(&i));
+    std.mem.reverse(u8, bytes);
+    return bytes.*;
+}
+
+test "write_network_int" {
+    try std.testing.expect(std.mem.eql(u8, &write_network_int(1000), "\x00\x00\x03\xe8"));
+    try std.testing.expect(std.mem.eql(u8, &write_network_int(12345), "\x00\x00\x30\x39"));
 }
 
 const Insert = packed struct {
@@ -12,8 +27,8 @@ const Insert = packed struct {
     fn from_bytes(bytes: [8]u8) Insert {
         std.debug.print("Parsing query message from {s}\n", .{bytes});
         return Insert{
-            .timestamp = parse_network_int(bytes[0..4].*),
-            .price = parse_network_int(bytes[4..8].*),
+            .timestamp = read_network_int(bytes[0..4].*),
+            .price = read_network_int(bytes[4..8].*),
         };
     }
 };
@@ -22,10 +37,9 @@ const Query = packed struct {
     maxtime: i32,
 
     fn from_bytes(bytes: [8]u8) Query {
-        std.debug.print("Parsing query message from {s}\n", .{bytes});
         return Query{
-            .mintime = parse_network_int(bytes[4..8].*),
-            .maxtime = parse_network_int(bytes[0..4].*),
+            .mintime = read_network_int(bytes[0..4].*),
+            .maxtime = read_network_int(bytes[4..8].*),
         };
     }
 };
@@ -37,7 +51,6 @@ test "query from bytes" {
 }
 
 const Database = struct {
-    allocator: std.mem.Allocator,
     data: std.ArrayList(Insert),
 
     pub fn insert(self: *Database, msg: Insert) !void {
@@ -50,21 +63,43 @@ const Database = struct {
     }
 
     pub fn query(self: Database, msg: Query) !i32 {
-        std.debug.print("Got query {any}. Database items: {any}", .{ msg, self.data.items });
-        var true_mean: f64 = 0;
-        var n: f64 = 0;
+        std.debug.print("Got query {any}. Database items: {any}\n", .{ msg, self.data.items });
+        var sum: i128 = 0;
+        var n: usize = 0;
         for (self.data.items) |item| {
             if (msg.mintime <= item.timestamp and item.timestamp <= msg.maxtime) {
-                const price: f64 = @floatFromInt(item.price);
-                true_mean = (n / n + 1) * true_mean + price / n;
                 n += 1;
+                sum += @as(i128, item.price);
             }
         }
-        return @intFromFloat(true_mean);
+        std.debug.print("n={any}, sum={any}\n", .{ n, sum });
+        return @intCast(@divFloor(sum, n));
     }
 };
 
+test "Database" {
+    var database = Database{ .data = try std.ArrayList(Insert).initCapacity(std.testing.allocator, 4) };
+    defer database.data.deinit();
+
+    try database.insert(Insert{ .timestamp = 12345, .price = 101 });
+    try database.insert(Insert{ .timestamp = 12346, .price = 102 });
+    try database.insert(Insert{ .timestamp = 12347, .price = 100 });
+    try database.insert(Insert{ .timestamp = 40960, .price = 5 });
+
+    const query = Query{ .mintime = 12288, .maxtime = 16384 };
+    try std.testing.expectEqual(101, database.query(query));
+}
+
 pub fn main() !void {
+    const number: i32 = 0x3e8;
+    const string = "\x00\x00\x03\xe8";
+    const same = read_network_int(string.*);
+    std.debug.print("{any}, {x}, {any}\n", .{ number, string, same });
+
+    const number2: i32 = 1000;
+    const bytes = std.mem.asBytes(&number2);
+    std.debug.print("{any}, {x}, {x}\n", .{ number2, bytes, std.mem.asBytes(&@bitReverse(number2)) });
+
     const allocator = std.heap.page_allocator;
 
     const address = try std.net.Address.parseIp4("0.0.0.0", 3491);
@@ -79,42 +114,35 @@ pub fn main() !void {
         const timeout: std.posix.timeval = .{ .tv_sec = 10, .tv_usec = 0 };
         try std.posix.setsockopt(connection.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
 
-        var database = Database{ .allocator = allocator, .data = std.ArrayList(Insert).init(allocator) };
+        var database = Database{ .data = std.ArrayList(Insert).init(allocator) };
         var receive_buf: [9]u8 = undefined;
-        while (true) {
+        read_and_handle: while (true) {
             var bytes_read: usize = 0;
             while (bytes_read < 9) {
                 const n_bytes = connection.stream.read(receive_buf[bytes_read..]) catch |err| switch (err) {
-                    error.WouldBlock => break :connection_loop,
+                    error.WouldBlock => continue :connection_loop,
                     else => |e| return e,
                 };
                 if (n_bytes <= 0) {
-                    break :connection_loop;
+                    continue :connection_loop;
                 }
                 bytes_read += n_bytes;
                 std.debug.print("Got {any} bytes, total bytes is now {any}: {s}\n", .{ n_bytes, bytes_read, receive_buf });
             }
 
             if (receive_buf[0] == 'I') {
-                database.insert(Insert.from_bytes(receive_buf[1..].*)) catch break :connection_loop;
+                database.insert(Insert.from_bytes(receive_buf[1..].*)) catch continue :read_and_handle;
             } else if (receive_buf[0] == 'Q') {
-                const result = database.query(Query.from_bytes(receive_buf[1..].*)) catch break :connection_loop;
+                const result = database.query(Query.from_bytes(receive_buf[1..].*)) catch continue :read_and_handle;
                 std.debug.print("Query result {any}, sending...\n", .{result});
-                connection.stream.writeAll(std.mem.asBytes(&result)) catch |err| switch (err) {
-                    error.ConnectionResetByPeer => break :connection_loop,
-                    error.BrokenPipe => break :connection_loop,
+                connection.stream.writeAll(&write_network_int(result)) catch |err| switch (err) {
+                    error.ConnectionResetByPeer => continue :connection_loop,
+                    error.BrokenPipe => continue :connection_loop,
                     else => |e| return e,
                 };
             } else {
-                break :connection_loop;
+                continue :connection_loop;
             }
         }
     }
-}
-
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
 }
