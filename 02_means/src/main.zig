@@ -25,7 +25,7 @@ const Insert = packed struct {
     price: i32,
 
     fn from_bytes(bytes: [8]u8) Insert {
-        std.debug.print("Parsing query message from {s}\n", .{bytes});
+        std.debug.print("Parsing query message from {x}\n", .{bytes});
         return Insert{
             .timestamp = read_network_int(bytes[0..4].*),
             .price = read_network_int(bytes[4..8].*),
@@ -54,6 +54,7 @@ const Database = struct {
     data: std.ArrayList(Insert),
 
     pub fn insert(self: *Database, msg: Insert) !void {
+        std.debug.print("Got insert {any}\n", .{msg});
         for (self.data.items) |item| {
             if (item.timestamp == msg.timestamp) {
                 return error.TimestampAlreadySet;
@@ -73,7 +74,11 @@ const Database = struct {
             }
         }
         std.debug.print("n={any}, sum={any}\n", .{ n, sum });
-        return @intCast(@divFloor(sum, n));
+        if (n == 0 and sum == 0) {
+            return 0;
+        } else {
+            return @intCast(@divFloor(sum, n));
+        }
     }
 };
 
@@ -105,35 +110,45 @@ pub fn main() !void {
     const address = try std.net.Address.parseIp4("0.0.0.0", 3491);
     var server = try address.listen(.{ .reuse_address = true, .reuse_port = true });
     defer server.deinit();
-    std.debug.print("listening...\n", .{});
 
     connection_loop: while (true) {
+        std.debug.print("listening...\n", .{});
         const connection = try server.accept();
         defer connection.stream.close();
 
-        const timeout: std.posix.timeval = .{ .tv_sec = 10, .tv_usec = 0 };
+        const timeout: std.posix.timeval = .{ .tv_sec = 15, .tv_usec = 0 };
         try std.posix.setsockopt(connection.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
 
         var database = Database{ .data = std.ArrayList(Insert).init(allocator) };
-        var receive_buf: [9]u8 = undefined;
+        var receive_buf: [9]u8 = [_]u8{0} ** 9;
         read_and_handle: while (true) {
             var bytes_read: usize = 0;
             while (bytes_read < 9) {
+                std.debug.print("Trying to read more bytes (so far {x})\n", .{receive_buf});
                 const n_bytes = connection.stream.read(receive_buf[bytes_read..]) catch |err| switch (err) {
-                    error.WouldBlock => continue :connection_loop,
+                    error.WouldBlock => {
+                        std.debug.print("Would block, bytes so far {x}\n", .{receive_buf});
+                        continue :connection_loop;
+                    },
                     else => |e| return e,
                 };
                 if (n_bytes <= 0) {
                     continue :connection_loop;
                 }
                 bytes_read += n_bytes;
-                std.debug.print("Got {any} bytes, total bytes is now {any}: {s}\n", .{ n_bytes, bytes_read, receive_buf });
+                std.debug.print("Got {any} bytes, total bytes is now {any}: {x}\n", .{ n_bytes, bytes_read, receive_buf });
             }
 
             if (receive_buf[0] == 'I') {
-                database.insert(Insert.from_bytes(receive_buf[1..].*)) catch continue :read_and_handle;
+                database.insert(Insert.from_bytes(receive_buf[1..].*)) catch |err| {
+                    std.debug.print("Error handling database insert {any}", .{err});
+                    continue :read_and_handle;
+                };
             } else if (receive_buf[0] == 'Q') {
-                const result = database.query(Query.from_bytes(receive_buf[1..].*)) catch continue :read_and_handle;
+                const result = database.query(Query.from_bytes(receive_buf[1..].*)) catch |err| {
+                    std.debug.print("Error handling database query {any}", .{err});
+                    continue :read_and_handle;
+                };
                 std.debug.print("Query result {any}, sending...\n", .{result});
                 connection.stream.writeAll(&write_network_int(result)) catch |err| switch (err) {
                     error.ConnectionResetByPeer => continue :connection_loop,
