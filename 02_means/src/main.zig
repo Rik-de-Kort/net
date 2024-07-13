@@ -51,32 +51,41 @@ test "query from bytes" {
 }
 
 const Database = struct {
-    data: std.ArrayList(Insert),
+    data: std.AutoHashMap(i32, i32),
+
+    pub fn init(allocator: std.mem.Allocator) Database {
+        return Database{ .data = std.AutoHashMap(i32, i32).init(allocator) };
+    }
+
+    pub fn deinit(self: *Database) void {
+        self.data.deinit();
+    }
 
     pub fn insert(self: *Database, msg: Insert) !void {
         //std.debug.print("Got insert {any}\n", .{msg});
-        for (self.data.items) |item| {
-            if (item.timestamp == msg.timestamp) {
-                return error.TimestampAlreadySet;
-            }
+        if (self.data.contains(msg.timestamp)) {
+            return error.TimestampAlreadySet;
         }
-        self.data.appendAssumeCapacity(msg);
-        if (self.data.items.len % 1000 == 0) {
-            std.debug.print("{any} items in database\n", .{self.data.items.len});
+        self.data.putAssumeCapacity(msg.timestamp, msg.price);
+        if (self.data.count() % 1000 == 0) {
+            std.debug.print("{any} items in database\n", .{self.data.count()});
         }
     }
 
     pub fn query(self: Database, msg: Query) !i32 {
         //std.debug.print("Got query {any}. Database items: {any}\n", .{ msg, self.data.items.len });
+        std.debug.print("Got query msg {any}\n", .{msg});
         var sum: i128 = 0;
         var n: usize = 0;
-        for (self.data.items) |item| {
-            if (msg.mintime <= item.timestamp and item.timestamp <= msg.maxtime) {
+
+        var iterator = self.data.iterator();
+        while (iterator.next()) |item| {
+            if (msg.mintime <= item.key_ptr.* and item.key_ptr.* <= msg.maxtime) {
                 n += 1;
-                sum += @as(i128, item.price);
+                sum += @as(i128, item.value_ptr.*);
             }
         }
-        //std.debug.print("n={any}, sum={any}\n", .{ n, sum });
+        std.debug.print("n={any}, sum={any}\n", .{ n, sum });
         if (n == 0 and sum == 0) {
             return 0;
         } else {
@@ -127,7 +136,7 @@ pub fn main() !void {
             try std.posix.setsockopt(connection.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
 
             try connections.append(connection);
-            var database = Database{ .data = std.ArrayList(Insert).init(allocator) };
+            var database = Database.init(allocator);
             try database.data.ensureTotalCapacity(200000);
             try databases.append(database);
         }
@@ -199,16 +208,16 @@ pub fn main() !void {
         // Handle broken connections
         var connections_left = std.ArrayList(std.net.Server.Connection).init(allocator);
         var databases_left = std.ArrayList(Database).init(allocator);
-        outer: for (connections.items, databases.items, 0..) |connection, database, i| {
+        outer: for (connections.items, databases.items, 0..) |connection, *database, i| {
             for (connections_to_clean.items) |j| {
                 if (i == j) {
                     //std.debug.print("Removing connection {any}\n", .{i});
-                    database.data.deinit();
+                    database.deinit();
                     continue :outer;
                 }
             }
             try connections_left.append(connection);
-            try databases_left.append(database);
+            try databases_left.append(database.*);
         }
         connections.clearAndFree();
         databases.clearAndFree();
