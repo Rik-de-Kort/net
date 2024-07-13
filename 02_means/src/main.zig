@@ -25,7 +25,7 @@ const Insert = packed struct {
     price: i32,
 
     fn from_bytes(bytes: [8]u8) Insert {
-        std.debug.print("Parsing query message from {x}\n", .{bytes});
+        //std.debug.print("Parsing query message from {x}\n", .{bytes});
         return Insert{
             .timestamp = read_network_int(bytes[0..4].*),
             .price = read_network_int(bytes[4..8].*),
@@ -54,17 +54,17 @@ const Database = struct {
     data: std.ArrayList(Insert),
 
     pub fn insert(self: *Database, msg: Insert) !void {
-        std.debug.print("Got insert {any}\n", .{msg});
+        //std.debug.print("Got insert {any}\n", .{msg});
         for (self.data.items) |item| {
             if (item.timestamp == msg.timestamp) {
                 return error.TimestampAlreadySet;
             }
         }
-        try self.data.append(msg);
+        self.data.appendAssumeCapacity(msg);
     }
 
     pub fn query(self: Database, msg: Query) !i32 {
-        std.debug.print("Got query {any}. Database items: {any}\n", .{ msg, self.data.items });
+        //std.debug.print("Got query {any}. Database items: {any}\n", .{ msg, self.data.items.len });
         var sum: i128 = 0;
         var n: usize = 0;
         for (self.data.items) |item| {
@@ -73,7 +73,7 @@ const Database = struct {
                 sum += @as(i128, item.price);
             }
         }
-        std.debug.print("n={any}, sum={any}\n", .{ n, sum });
+        //std.debug.print("n={any}, sum={any}\n", .{ n, sum });
         if (n == 0 and sum == 0) {
             return 0;
         } else {
@@ -95,69 +95,106 @@ test "Database" {
     try std.testing.expectEqual(101, database.query(query));
 }
 
+const Connection = struct { connection: std.net.Server.Connection, database: Database };
+
 pub fn main() !void {
-    const number: i32 = 0x3e8;
-    const string = "\x00\x00\x03\xe8";
-    const same = read_network_int(string.*);
-    std.debug.print("{any}, {x}, {any}\n", .{ number, string, same });
-
-    const number2: i32 = 1000;
-    const bytes = std.mem.asBytes(&number2);
-    std.debug.print("{any}, {x}, {x}\n", .{ number2, bytes, std.mem.asBytes(&@bitReverse(number2)) });
-
-    const allocator = std.heap.page_allocator;
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
 
     const address = try std.net.Address.parseIp4("0.0.0.0", 3491);
-    var server = try address.listen(.{ .reuse_address = true, .reuse_port = true });
+    var server = try address.listen(.{ .reuse_address = true, .reuse_port = true, .force_nonblocking = true });
     defer server.deinit();
 
-    connection_loop: while (true) {
-        std.debug.print("listening...\n", .{});
-        const connection = try server.accept();
-        defer connection.stream.close();
+    var connections = std.ArrayList(std.net.Server.Connection).init(allocator);
+    defer connections.deinit();
+    var databases = std.ArrayList(Database).init(allocator);
+    defer databases.deinit();
 
-        const timeout: std.posix.timeval = .{ .tv_sec = 15, .tv_usec = 0 };
-        try std.posix.setsockopt(connection.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
+    std.debug.print("listening...\n", .{});
+    while (true) {
+        // Check for new connections
+        //std.debug.print("Checking for new connections", .{});
+        if (server.accept() catch |err| switch (err) {
+            error.WouldBlock => null,
+            else => |e| return e,
+        }) |connection| {
+            const timeout: std.posix.timeval = .{ .tv_sec = 0, .tv_usec = 25000 };
+            try std.posix.setsockopt(connection.stream.handle, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&timeout));
 
-        var database = Database{ .data = std.ArrayList(Insert).init(allocator) };
-        var receive_buf: [9]u8 = [_]u8{0} ** 9;
-        read_and_handle: while (true) {
+            try connections.append(connection);
+            var database = Database{ .data = std.ArrayList(Insert).init(allocator) };
+            try database.data.ensureTotalCapacity(200000);
+            try databases.append(database);
+        }
+
+        // Handle any open connections
+        var connections_to_clean = std.ArrayList(usize).init(allocator);
+        per_connection: for (connections.items, databases.items, 0..) |connection, *database, i| {
+            if (database.data.items.len % 1000 == 0) {
+                std.debug.print("Handling connection {any}. Items in database {any}\n", .{ i, database.data.items.len });
+            }
+            var receive_buf: [9]u8 = [_]u8{0} ** 9;
             var bytes_read: usize = 0;
             while (bytes_read < 9) {
-                std.debug.print("Trying to read more bytes (so far {x})\n", .{receive_buf});
                 const n_bytes = connection.stream.read(receive_buf[bytes_read..]) catch |err| switch (err) {
                     error.WouldBlock => {
-                        std.debug.print("Would block, bytes so far {x}\n", .{receive_buf});
-                        continue :connection_loop;
+                        //std.debug.print("would block!\n", .{});
+                        continue :per_connection;
+                    },
+                    error.NotOpenForReading => {
+                        //std.debug.print("not open for reading!\n", .{});
+                        try connections_to_clean.append(i);
+                        continue :per_connection;
                     },
                     else => |e| return e,
                 };
                 if (n_bytes <= 0) {
-                    continue :connection_loop;
+                    //std.debug.print("n_bytes {any}\n", .{n_bytes});
+                    try connections_to_clean.append(i);
+                    continue :per_connection;
                 }
                 bytes_read += n_bytes;
-                std.debug.print("Got {any} bytes, total bytes is now {any}: {x}\n", .{ n_bytes, bytes_read, receive_buf });
             }
+            //std.debug.print("Got {any} bytes: {x}\n", .{ bytes_read, receive_buf });
 
             if (receive_buf[0] == 'I') {
                 database.insert(Insert.from_bytes(receive_buf[1..].*)) catch |err| {
-                    std.debug.print("Error handling database insert {any}", .{err});
-                    continue :read_and_handle;
+                    std.debug.print("Error handling database insert {any}\n", .{err});
+                    continue :per_connection;
                 };
             } else if (receive_buf[0] == 'Q') {
                 const result = database.query(Query.from_bytes(receive_buf[1..].*)) catch |err| {
-                    std.debug.print("Error handling database query {any}", .{err});
-                    continue :read_and_handle;
+                    std.debug.print("Error handling database query {any}\n", .{err});
+                    continue :per_connection;
                 };
-                std.debug.print("Query result {any}, sending...\n", .{result});
+                //std.debug.print("Query result {any}, sending...\n", .{result});
                 connection.stream.writeAll(&write_network_int(result)) catch |err| switch (err) {
-                    error.ConnectionResetByPeer => continue :connection_loop,
-                    error.BrokenPipe => continue :connection_loop,
+                    error.ConnectionResetByPeer, error.BrokenPipe => {
+                        try connections_to_clean.append(i);
+                        continue :per_connection;
+                    },
                     else => |e| return e,
                 };
-            } else {
-                continue :connection_loop;
             }
         }
+
+        // Handle broken connections
+        var connections_left = std.ArrayList(std.net.Server.Connection).init(allocator);
+        var databases_left = std.ArrayList(Database).init(allocator);
+        outer: for (connections.items, databases.items, 0..) |connection, database, i| {
+            for (connections_to_clean.items) |j| {
+                if (i == j) {
+                    //std.debug.print("Removing connection {any}\n", .{i});
+                    database.data.deinit();
+                    continue :outer;
+                }
+            }
+            try connections_left.append(connection);
+            try databases_left.append(database);
+        }
+        connections.clearAndFree();
+        databases.clearAndFree();
+        connections = connections_left;
+        databases = databases_left;
     }
 }
