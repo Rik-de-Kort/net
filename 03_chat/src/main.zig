@@ -8,14 +8,25 @@ fn connect_user(server: *std.net.Server) !?User {
         error.WouldBlock => return null,
         else => |e| return e,
     };
+    errdefer connection.stream.close();
 
     try connection.stream.writeAll("name?\n");
     var name_buf: [16]u8 = undefined;
     const n_bytes = try connection.stream.read(&name_buf);
-    var i: usize = 0;
-    while (i < n_bytes and name_buf[i] != '\n') : (i += 1) {}
-    std.debug.print("Got user with name {s}\n", .{name_buf[0..i]});
-    return User{ .name = name_buf[0..i], .connection = connection };
+    if (n_bytes <= 0 or 16 <= n_bytes) { // Todo: what if we only got one byte, equal to \n?
+        return error.InvalidLength;
+    }
+    var name_length: usize = 0;
+    for (name_buf[0..n_bytes]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '\n') {
+            return error.InvalidCharacter;
+        } else if (byte == '\n') {
+            break;
+        }
+        name_length += 1;
+    }
+    std.debug.print("Got user with name {s}\n", .{name_buf[0..name_length]});
+    return User{ .name = name_buf[0..name_length], .connection = connection };
 }
 
 pub fn main() !void {
@@ -24,7 +35,7 @@ pub fn main() !void {
     std.debug.print("{any}\n", .{server});
 
     var users = std.ArrayList(User).init(std.heap.page_allocator);
-    if (try connect_user(&server)) |user| {
+    if (connect_user(&server) catch null) |user| {
         try users.append(user);
     }
     std.debug.print("users is now {any}\n", .{users});
