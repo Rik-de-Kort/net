@@ -29,21 +29,33 @@ fn connect_user(server: *std.net.Server) !?User {
     return User{ .name = name_buf[0..name_length], .connection = connection };
 }
 
+fn present_users_message(users: std.ArrayList(User)) ![]const u8 {
+    var result = std.ArrayList(u8).init(users.allocator);
+    try result.appendSlice("* The room contains: ");
+    if (users.items.len == 0) return result.toOwnedSlice();
+    try result.appendSlice(users.items[0].name);
+    for (users.items[1..]) |user| {
+        try result.appendSlice(", ");
+        try result.appendSlice(user.name);
+    }
+    return result.toOwnedSlice();
+}
+
 pub fn main() !void {
     const address = try std.net.Address.parseIp4("0.0.0.0", 3491);
     var server = try address.listen(.{ .reuse_address = true, .reuse_port = true });
     std.debug.print("{any}\n", .{server});
 
     var users = std.ArrayList(User).init(std.heap.page_allocator);
-    if (connect_user(&server) catch null) |user| {
-        try users.append(user);
-    }
-    std.debug.print("users is now {any}\n", .{users});
-}
+    while (true) {
+        if (connect_user(&server) catch null) |user| {
+            const message = try present_users_message(users);
+            std.debug.print("{s}", .{message});
+            try user.connection.stream.writeAll(message);
+            std.heap.page_allocator.free(message);
 
-test "simple test" {
-    var list = std.ArrayList(i32).init(std.testing.allocator);
-    defer list.deinit(); // try commenting this out and see if zig detects the memory leak!
-    try list.append(42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
+            try users.append(user);
+        }
+        std.debug.print("users is now {any}\n", .{users});
+    }
 }
