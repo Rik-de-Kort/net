@@ -1,6 +1,26 @@
 const std = @import("std");
 const net = @import("std.net");
 
+const BlockingPoller = struct {
+    allocator: std.mem.Allocator,
+    pollfds: []std.posix.pollfd,
+    fifos: []std.io.PollFifo,
+
+    pub fn poll(self: *BlockingPoller) !bool {
+        // -1 is what makes it blocking
+        const events_len = std.posix.poll(&self.pollfds, -1);
+        if (events_len == 0) {
+            return false;
+        }
+        for (&self.pollfds, &self.fifos) |*poll_fd, fifo| {
+            _ = fifo;
+            if (poll_fd.revents & std.posix.POLL.IN) {
+                // Got a jammy bastard!
+            }
+        }
+    }
+};
+
 const User = struct {
     allocator: std.mem.Allocator,
     name: []const u8,
