@@ -121,6 +121,13 @@ const User = union(UserType) {
     joined: JoinedUser,
 };
 
+// Todo:
+// - Handle partial messages from users. Somehow "leave" then in the queue if we don't see \n, then make sure they pop up again?
+// - Check for non-joined user and prompt name
+// - Check for messages and broadcast (add broadcast message type)
+// - Check for disconnections
+// - Run this on protohackers and probably deal with edge cases: disconnects of non-joined users and the like
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
