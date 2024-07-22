@@ -39,9 +39,13 @@ const BlockingPoller = struct {
                 // Got a jammy bastard!
                 if (i > 0) {
                     std.debug.print("Trying to read from {any}, {any}\n", .{ i, poll_fd.fd });
-                    const buf = try fifo.writableWithSize(512);
-                    const n_bytes = try std.posix.read(poll_fd.fd, buf);
-                    fifo.update(n_bytes);
+                    const file_handle = std.fs.File{ .handle = poll_fd.fd };
+                    const reader = file_handle.reader();
+                    const writer = fifo.writer();
+                    reader.streamUntilDelimiter(writer, '\n', null) catch |err| switch (err) {
+                        error.EndOfStream => continue,
+                        else => |e| return e,
+                    };
                 }
                 try result.new_data.append(i);
             } else if (poll_fd.revents & std.posix.POLL.ERR != 0) {
@@ -64,13 +68,14 @@ const BlockingPoller = struct {
     }
 
     pub fn broadcast(self: BlockingPoller, from: ?usize, msg: []const u8) !void {
-        for (0.., self.streams) |i, stream| {
-            if (i == from) continue;
+        for (0.., self.streams.items) |i, stream| {
+            if (i == from or i == 0) continue;
             try stream.writeAll(msg);
         }
     }
 
     pub fn send(self: BlockingPoller, to: usize, msg: []const u8) !void {
+        std.debug.print("Sending message '{s}' to {any}\n", .{ msg, to });
         try self.streams.items[to].writeAll(msg);
     }
 
@@ -84,17 +89,18 @@ const BlockingPoller = struct {
     }
 
     pub fn orderedRemove(self: *BlockingPoller, index: usize) void {
+        std.debug.print("Removing {any}\n", .{index});
         _ = self.pollfds.orderedRemove(index);
         self.fifos.items[index].deinit();
         _ = self.fifos.orderedRemove(index);
-        self.streams[index].close();
+        self.streams.items[index].close();
         _ = self.streams.orderedRemove(index);
     }
 };
 
 const BroadcastMessage = struct {
     msg: []const u8,
-    sender: ?usize,
+    from: ?usize,
 };
 
 const DirectMessage = struct {
@@ -111,18 +117,21 @@ const ConnectedUser = struct {
 
 const JoinedUser = struct {
     index: usize,
-    name: []const u8,
+    name: std.ArrayList(u8),
 };
 
-const UserType = enum { connected, joined };
+const ServerUser = struct {};
+
+const UserType = enum { server, connected, joined };
 
 const User = union(UserType) {
+    server: ServerUser,
     connected: ConnectedUser,
     joined: JoinedUser,
 };
 
 // Todo:
-// - Handle partial messages from users. Somehow "leave" then in the queue if we don't see \n, then make sure they pop up again?
+// - Handle multiple messages sent at the same time?
 // - Check for non-joined user and prompt name
 // - Check for messages and broadcast (add broadcast message type)
 // - Check for disconnections
@@ -140,27 +149,63 @@ pub fn main() !void {
     defer poller.deinit();
 
     var users = std.ArrayList(User).init(allocator);
+    try users.append(User{ .server = .{} });
     while (true) {
         const poll_info = try poller.poll();
         var send_info = std.ArrayList(Message).init(allocator);
+        defer send_info.deinit();
+        var disconnect_info = std.ArrayList(usize).init(allocator);
+        defer disconnect_info.deinit();
+
         for (poll_info.new_data.items) |index| {
-            if (index == 0) {
-                const connection = try server.accept();
-                const new_index = try poller.add(connection.stream);
-                try send_info.append(Message{ .direct = .{ .msg = "welcome to budget chat. What's your name?\n", .to = new_index } });
-                try users.append(User{ .connected = .{ .index = new_index } });
-                std.debug.print("added user {any}\n", .{users.items[users.items.len - 1]});
+            const this_user = users.items[index];
+            switch (this_user) {
+                User.server => {
+                    const connection = try server.accept();
+                    const new_index = try poller.add(connection.stream);
+                    try send_info.append(Message{ .direct = .{ .msg = "welcome to budget chat. What's your name?\n", .to = new_index } });
+                    try users.append(User{ .connected = .{ .index = new_index } });
+                    std.debug.print("added user {any}\n", .{users.items[users.items.len - 1]});
+                },
+                User.connected => {
+                    var name_buf: [17]u8 = undefined;
+                    const n_bytes = poller.fifos.items[index].read(&name_buf);
+                    std.debug.print("Got {any} bytes {s}\n", .{ n_bytes, name_buf[0..n_bytes] });
+                    if (n_bytes <= 0 or 17 <= n_bytes) {
+                        try disconnect_info.append(index);
+                    }
+                    for (name_buf[0..n_bytes]) |c| {
+                        if (!std.ascii.isAlphanumeric(c)) {
+                            try disconnect_info.append(index);
+                        }
+                    }
+
+                    var name = try std.ArrayList(u8).initCapacity(allocator, n_bytes);
+                    try name.writer().writeAll(name_buf[0..n_bytes]);
+                    users.items[index] = User{ .joined = .{ .index = index, .name = name } };
+
+                    var join_msg = try std.ArrayList(u8).initCapacity(allocator, n_bytes + 23);
+                    try std.fmt.format(join_msg.writer(), "* {s} has joined the room\n", .{name_buf[0..n_bytes]});
+                    try send_info.append(Message{ .broadcast = .{ .msg = join_msg.items, .from = index } });
+
+                    var presence_msg = std.ArrayList(u8).init(allocator);
+                    try std.fmt.format(presence_msg.writer(), "* active users are ...\n", .{});
+                    try send_info.append(Message{ .direct = .{ .msg = presence_msg.items, .to = index } });
+                },
+                User.joined => std.debug.print("Joined user {any}\n", .{this_user.joined}),
             }
+        }
+
+        for (disconnect_info.items) |index| {
+            _ = poller.orderedRemove(index);
+            _ = users.orderedRemove(index);
         }
         for (send_info.items) |message| {
             switch (message) {
-                MessageTag.direct => try poller.send(message.direct.to, message.direct.msg),
-                MessageTag.broadcast => for (users.items) |user| {
-                    switch (user) {
-                        UserType.joined => try poller.send(user.joined.index, message.broadcast.msg),
-                        UserType.connected => {},
-                    }
+                MessageTag.direct => {
+                    try poller.send(message.direct.to, message.direct.msg);
                 },
+                MessageTag.broadcast => try poller.broadcast(message.broadcast.from, message.broadcast.msg),
             }
         }
     }
