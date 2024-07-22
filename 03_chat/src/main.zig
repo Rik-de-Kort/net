@@ -131,10 +131,8 @@ const User = union(UserType) {
 };
 
 // Todo:
-// - Handle multiple messages sent at the same time?
-// - Check for non-joined user and prompt name
-// - Check for messages and broadcast (add broadcast message type)
-// - Check for disconnections
+// - Check for messages and broadcast
+// - Finish disconnects (dea with hangup bug and ...)?
 // - Run this on protohackers and probably deal with edge cases: disconnects of non-joined users and the like
 
 pub fn main() !void {
@@ -180,23 +178,46 @@ pub fn main() !void {
                         }
                     }
 
+                    // Fish out name so we can wrangle strings
                     var name = try std.ArrayList(u8).initCapacity(allocator, n_bytes);
                     try name.writer().writeAll(name_buf[0..n_bytes]);
-                    users.items[index] = User{ .joined = .{ .index = index, .name = name } };
 
+                    // Send "x has joined the room" to everyone
                     var join_msg = try std.ArrayList(u8).initCapacity(allocator, n_bytes + 23);
                     try std.fmt.format(join_msg.writer(), "* {s} has joined the room\n", .{name_buf[0..n_bytes]});
                     try send_info.append(Message{ .broadcast = .{ .msg = join_msg.items, .from = index } });
 
+                    // Send "room contains a, b, c" to joined user
                     var presence_msg = std.ArrayList(u8).init(allocator);
-                    try std.fmt.format(presence_msg.writer(), "* active users are ...\n", .{});
+                    var just_names = try std.ArrayList([]const u8).initCapacity(allocator, users.items.len);
+                    for (users.items) |user| {
+                        switch (user) {
+                            User.server => {},
+                            User.connected => {},
+                            User.joined => just_names.appendAssumeCapacity(user.joined.name.items),
+                        }
+                    }
+                    const user_list = try std.mem.join(allocator, ", ", just_names.items);
+
+                    try std.fmt.format(presence_msg.writer(), "* active users are {s}\n", .{user_list});
                     try send_info.append(Message{ .direct = .{ .msg = presence_msg.items, .to = index } });
+
+                    // Turn user into joined user
+                    users.items[index] = User{ .joined = .{ .index = index, .name = name } };
                 },
                 User.joined => std.debug.print("Joined user {any}\n", .{this_user.joined}),
             }
         }
 
         for (disconnect_info.items) |index| {
+            switch (users.items[index]) {
+                User.joined => |user| {
+                    var msg = std.ArrayList(u8).init(allocator);
+                    try std.fmt.format(msg.writer(), "{s} disconnected\n", .{user.name.items});
+                    try send_info.append(Message{ .broadcast = .{ .from = index, .msg = msg.items } });
+                },
+                else => {},
+            }
             _ = poller.orderedRemove(index);
             _ = users.orderedRemove(index);
         }
