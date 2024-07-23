@@ -3,6 +3,7 @@ const net = @import("std.net");
 
 const BlockingPoller = struct {
     allocator: std.mem.Allocator,
+    users: std.ArrayList(User),
     pollfds: std.ArrayList(std.posix.pollfd),
     streams: std.ArrayList(std.net.Stream),
     fifos: std.ArrayList(std.io.PollFifo),
@@ -13,8 +14,8 @@ const BlockingPoller = struct {
     };
 
     pub fn init(allocator: std.mem.Allocator, server: std.net.Stream) !BlockingPoller {
-        var self = BlockingPoller{ .allocator = allocator, .streams = std.ArrayList(std.net.Stream).init(allocator), .pollfds = std.ArrayList(std.posix.pollfd).init(allocator), .fifos = std.ArrayList(std.io.PollFifo).init(allocator) };
-        _ = try self.add(server);
+        var self = BlockingPoller{ .allocator = allocator, .users = std.ArrayList(User).init(allocator), .streams = std.ArrayList(std.net.Stream).init(allocator), .pollfds = std.ArrayList(std.posix.pollfd).init(allocator), .fifos = std.ArrayList(std.io.PollFifo).init(allocator) };
+        _ = try self.add(server, User{ .server = ServerUser{} });
         return self;
     }
 
@@ -22,6 +23,7 @@ const BlockingPoller = struct {
         self.pollfds.deinit();
         self.streams.deinit();
         self.fifos.deinit();
+        self.users.deinit();
     }
 
     pub fn poll(self: *BlockingPoller) !PollInfo {
@@ -54,7 +56,7 @@ const BlockingPoller = struct {
                         },
                         else => |e| return e,
                     };
-                    std.debug.print("Read from {any}, {any} bytes in buffer\n", .{ i, fifo.count });
+                    std.debug.print("Read from {any}, {any} bytes in buffer: {s}\n", .{ i, fifo.count, fifo.readableSliceOfLen(fifo.count) });
                 }
                 try result.new_data.append(i);
             } else if (poll_fd.revents & std.posix.POLL.ERR != 0) {
@@ -76,9 +78,15 @@ const BlockingPoller = struct {
     }
 
     pub fn broadcast(self: BlockingPoller, from: ?usize, msg: []const u8) !void {
-        for (0.., self.streams.items) |i, stream| {
-            if (i == from or i == 0) continue;
-            try stream.writeAll(msg);
+        for (0.., self.streams.items, self.users.items) |i, stream, user| {
+            switch (user) {
+                .connected => continue,
+                .server => continue,
+                .joined => {
+                    if (i == from) continue;
+                    try stream.writeAll(msg);
+                },
+            }
         }
     }
 
@@ -87,12 +95,14 @@ const BlockingPoller = struct {
         try self.streams.items[to].writeAll(msg);
     }
 
-    pub fn add(self: *BlockingPoller, stream: std.net.Stream) !usize {
+    pub fn add(self: *BlockingPoller, stream: std.net.Stream, user: User) !usize {
         try self.pollfds.append(std.posix.pollfd{ .fd = stream.handle, .events = std.posix.POLL.IN, .revents = 0 });
         errdefer _ = self.pollfds.pop();
         try self.fifos.append(std.io.PollFifo.init(self.allocator));
         errdefer _ = self.fifos.pop();
         try self.streams.append(stream);
+        errdefer _ = self.streams.pop();
+        try self.users.append(user);
         return self.streams.items.len - 1;
     }
 
@@ -103,6 +113,7 @@ const BlockingPoller = struct {
         _ = self.fifos.orderedRemove(index);
         self.streams.items[index].close();
         _ = self.streams.orderedRemove(index);
+        _ = self.users.orderedRemove(index);
     }
 };
 
@@ -119,14 +130,9 @@ const DirectMessage = struct {
 const MessageTag = enum { broadcast, direct };
 const Message = union(MessageTag) { broadcast: BroadcastMessage, direct: DirectMessage };
 
-const ConnectedUser = struct {
-    index: usize,
-};
+const ConnectedUser = struct {};
 
-const JoinedUser = struct {
-    index: usize,
-    name: std.ArrayList(u8),
-};
+const JoinedUser = struct { name: std.ArrayList(u8) };
 
 const ServerUser = struct {};
 
@@ -152,22 +158,18 @@ pub fn main() !void {
     var poller = try BlockingPoller.init(allocator, server.stream);
     defer poller.deinit();
 
-    var users = std.ArrayList(User).init(allocator);
-    try users.append(User{ .server = .{} });
     while (true) {
         var poll_info = try poller.poll();
         var send_info = std.ArrayList(Message).init(allocator);
         defer send_info.deinit();
 
         for (poll_info.new_data.items) |index| {
-            const this_user = users.items[index];
+            const this_user = poller.users.items[index];
             switch (this_user) {
                 User.server => {
                     const connection = try server.accept();
-                    const new_index = try poller.add(connection.stream);
+                    const new_index = try poller.add(connection.stream, User{ .connected = .{} });
                     try send_info.append(Message{ .direct = .{ .msg = "welcome to budget chat. What's your name?\n", .to = new_index } });
-                    try users.append(User{ .connected = .{ .index = new_index } });
-                    std.debug.print("added user {any}\n", .{users.items[users.items.len - 1]});
                 },
                 User.connected => {
                     var name_buf: [17]u8 = undefined;
@@ -193,8 +195,8 @@ pub fn main() !void {
 
                     // Send "room contains a, b, c" to joined user
                     var presence_msg = std.ArrayList(u8).init(allocator);
-                    var just_names = try std.ArrayList([]const u8).initCapacity(allocator, users.items.len);
-                    for (users.items) |user| {
+                    var just_names = try std.ArrayList([]const u8).initCapacity(allocator, poller.users.items.len);
+                    for (poller.users.items) |user| {
                         switch (user) {
                             User.server => {},
                             User.connected => {},
@@ -207,11 +209,9 @@ pub fn main() !void {
                     try send_info.append(Message{ .direct = .{ .msg = presence_msg.items, .to = index } });
 
                     // Turn user into joined user
-                    users.items[index] = User{ .joined = .{ .index = index, .name = name } };
+                    poller.users.items[index] = User{ .joined = .{ .name = name } };
                 },
                 User.joined => |user| {
-                    std.debug.print("Joined user\n", .{});
-
                     var message_buf: [1024]u8 = undefined;
                     const n_bytes = poller.fifos.items[index].read(&message_buf);
                     if (n_bytes > 1000) {
@@ -234,7 +234,7 @@ pub fn main() !void {
             }
             try seen.append(index);
 
-            switch (users.items[index]) {
+            switch (poller.users.items[index]) {
                 User.joined => |user| {
                     var msg = std.ArrayList(u8).init(allocator);
                     try std.fmt.format(msg.writer(), "* {s} disconnected\n", .{user.name.items});
@@ -243,7 +243,6 @@ pub fn main() !void {
                 else => {},
             }
             _ = poller.orderedRemove(index);
-            _ = users.orderedRemove(index);
         }
         for (send_info.items) |message| {
             switch (message) {
