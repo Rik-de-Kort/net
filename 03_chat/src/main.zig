@@ -34,18 +34,27 @@ const BlockingPoller = struct {
         if (events_len == 0) {
             return result;
         }
+
         for (0.., self.pollfds.items, self.fifos.items) |i, *poll_fd, *fifo| {
             if (poll_fd.revents & std.posix.POLL.IN != 0) {
                 // Got a jammy bastard!
                 if (i > 0) {
-                    std.debug.print("Trying to read from {any}, {any}\n", .{ i, poll_fd.fd });
+                    std.debug.print("Trying to read from {any}, {any} bytes in buffer\n", .{ i, fifo.count });
+                    const original_count = fifo.count;
+
                     const file_handle = std.fs.File{ .handle = poll_fd.fd };
                     const reader = file_handle.reader();
                     const writer = fifo.writer();
                     reader.streamUntilDelimiter(writer, '\n', null) catch |err| switch (err) {
-                        error.EndOfStream => continue,
+                        error.EndOfStream => {
+                            if (fifo.count == original_count) { // No bytes, must be disconnected
+                                try result.disconnected.append(i);
+                            }
+                            continue;
+                        },
                         else => |e| return e,
                     };
+                    std.debug.print("Read from {any}, {any} bytes in buffer\n", .{ i, fifo.count });
                 }
                 try result.new_data.append(i);
             } else if (poll_fd.revents & std.posix.POLL.ERR != 0) {
@@ -59,11 +68,10 @@ const BlockingPoller = struct {
                 }
                 try result.disconnected.append(i);
                 std.debug.print("Disconnected {any}\n", .{poll_fd});
-            } else {
+            } else if (poll_fd.revents != 0) {
                 std.debug.print("These events? {any}\n", .{poll_fd.revents});
             }
         }
-        std.debug.print("finished poll, posting {any}, {any}\n", .{ result.new_data.items, result.disconnected.items });
         return result;
     }
 
@@ -132,7 +140,6 @@ const User = union(UserType) {
 
 // Todo:
 // - Check for messages and broadcast
-// - Finish disconnects (dea with hangup bug and ...)?
 // - Run this on protohackers and probably deal with edge cases: disconnects of non-joined users and the like
 
 pub fn main() !void {
@@ -149,11 +156,9 @@ pub fn main() !void {
     var users = std.ArrayList(User).init(allocator);
     try users.append(User{ .server = .{} });
     while (true) {
-        const poll_info = try poller.poll();
+        var poll_info = try poller.poll();
         var send_info = std.ArrayList(Message).init(allocator);
         defer send_info.deinit();
-        var disconnect_info = std.ArrayList(usize).init(allocator);
-        defer disconnect_info.deinit();
 
         for (poll_info.new_data.items) |index| {
             const this_user = users.items[index];
@@ -170,11 +175,11 @@ pub fn main() !void {
                     const n_bytes = poller.fifos.items[index].read(&name_buf);
                     std.debug.print("Got {any} bytes {s}\n", .{ n_bytes, name_buf[0..n_bytes] });
                     if (n_bytes <= 0 or 17 <= n_bytes) {
-                        try disconnect_info.append(index);
+                        try poll_info.disconnected.append(index);
                     }
                     for (name_buf[0..n_bytes]) |c| {
                         if (!std.ascii.isAlphanumeric(c)) {
-                            try disconnect_info.append(index);
+                            try poll_info.disconnected.append(index);
                         }
                     }
 
@@ -209,11 +214,18 @@ pub fn main() !void {
             }
         }
 
-        for (disconnect_info.items) |index| {
+        var seen = std.ArrayList(usize).init(allocator);
+        for (poll_info.disconnected.items) |index| {
+            // Make sure to deduplicate
+            for (seen.items) |seen_index| {
+                if (seen_index == index) continue; // Already disconnected
+            }
+            try seen.append(index);
+
             switch (users.items[index]) {
                 User.joined => |user| {
                     var msg = std.ArrayList(u8).init(allocator);
-                    try std.fmt.format(msg.writer(), "{s} disconnected\n", .{user.name.items});
+                    try std.fmt.format(msg.writer(), "* {s} disconnected\n", .{user.name.items});
                     try send_info.append(Message{ .broadcast = .{ .from = index, .msg = msg.items } });
                 },
                 else => {},
