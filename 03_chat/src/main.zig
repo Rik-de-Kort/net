@@ -139,7 +139,6 @@ const User = union(UserType) {
 };
 
 // Todo:
-// - Check for messages and broadcast
 // - Run this on protohackers and probably deal with edge cases: disconnects of non-joined users and the like
 
 pub fn main() !void {
@@ -210,7 +209,20 @@ pub fn main() !void {
                     // Turn user into joined user
                     users.items[index] = User{ .joined = .{ .index = index, .name = name } };
                 },
-                User.joined => std.debug.print("Joined user {any}\n", .{this_user.joined}),
+                User.joined => |user| {
+                    std.debug.print("Joined user\n", .{});
+
+                    var message_buf: [1024]u8 = undefined;
+                    const n_bytes = poller.fifos.items[index].read(&message_buf);
+                    if (n_bytes > 1000) {
+                        try poll_info.disconnected.append(index);
+                        continue;
+                    }
+
+                    var sent_msg = std.ArrayList(u8).init(allocator);
+                    try std.fmt.format(sent_msg.writer(), "[{s}] {s}\n", .{ user.name.items, message_buf[0..n_bytes] });
+                    try send_info.append(Message{ .broadcast = .{ .msg = sent_msg.items, .from = index } });
+                },
             }
         }
 
