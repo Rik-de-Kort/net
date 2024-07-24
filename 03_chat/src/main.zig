@@ -283,7 +283,7 @@ pub fn main() !void {
             state.connect = false;
         }
         for (state.in.items) |in_message| {
-            const user = server.users.items[in_message.from];
+            const user = server.get_user(in_message.from) orelse unreachable;
             switch (user.kind) {
                 .server => unreachable,
                 .connected => {
