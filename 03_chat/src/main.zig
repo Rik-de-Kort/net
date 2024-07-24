@@ -78,6 +78,116 @@ const Server = struct {
         std.debug.print("\n", .{});
     }
 
+    pub fn get_pollfds(self: *Server, allocator: std.mem.Allocator) !std.ArrayList(std.posix.pollfd) {
+        var pollfds = try std.ArrayList(std.posix.pollfd).initCapacity(allocator, self.users.items.len);
+        defer pollfds.deinit();
+
+        const events = std.posix.POLL.IN | std.posix.POLL.HUP | std.posix.POLL.ERR | std.posix.POLL.OUT;
+        for (self.users.items) |user| {
+            pollfds.appendAssumeCapacity(.{ .fd = user.stream.handle, .events = events, .revents = 0 });
+        }
+        return pollfds;
+    }
+
+    pub const ServerState = struct {
+        allocator: std.mem.Allocator,
+        in: std.ArrayList(InMessage),
+        out: std.ArrayList(OutMessage),
+        connect: bool,
+        disconnect: std.ArrayList(usize),
+
+        const Self = @This();
+
+        pub fn init(allocator: std.mem.Allocator) Self {
+            return .{
+                .allocator = std.mem.Allocator,
+                .in = std.ArrayList(InMessage).init(allocator),
+                .out = std.ArrayList(OutMessage).init(allocator),
+                .connect = false,
+                .disconnect = std.ArrayList(usize).init(allocator),
+            };
+        }
+
+        pub fn deinit(self: *Self) void {
+            self.in.deinit();
+            self.out.deinit();
+            self.disconnect.deinit();
+        }
+    };
+
+    /// Send messages, receive messages. Returns an owned slice of InMessages, caller is responsible for freeing.
+    pub fn communicate(self: *Server, state: ServerState) !ServerState {
+        const pollfds = self.get_pollfds(state.allocator);
+        const n_events = try std.posix.poll(pollfds.items, -1);
+        if (n_events == 0) {
+            return;
+        }
+
+        var sent_messages = std.ArrayList(usize).init(state.allocator);
+
+        for (pollfds.items, self.users.items, 0..) |*pollfd, *user, index| {
+            const poll_in = pollfd.revents & std.posix.POLL.IN;
+            const poll_out = pollfd.revents & std.posix.POLL.OUT;
+            const poll_hup = pollfd.revents & std.posix.POLL.HUP;
+            const poll_err = pollfd.revents & std.posix.POLL.ERR;
+            std.debug.print("[{s}] ({any}) IN: {any} OUT {any} HUP: {any} ERR: {any}\n", .{
+                user.name.items,
+                index,
+                poll_in,
+                poll_out,
+                poll_hup,
+                poll_err,
+            });
+
+            if (poll_in) {
+                // Handle read
+                if (user.kind != .server) {
+                    std.debug.print("Trying to read from {any} ({s})\n", .{ index, user.name.items });
+                    const original_count = user.fifo.count;
+
+                    const file_handle = std.fs.File{ .handle = pollfd.fd };
+                    const reader = file_handle.reader();
+                    const writer = user.fifo.writer();
+                    reader.streamUntilDelimiter(writer, '\n', null) catch |err| switch (err) {
+                        error.EndOfStream => {
+                            if (user.fifo.count == original_count) { // No bytes, must be disconnected
+                                try state.disconnects.append(index);
+                                std.debug.print("Got no bytes, maybe disconnect {s}!\n", .{self.debugGetName(index)});
+                            }
+                            continue;
+                        },
+                        else => |e| return e,
+                    };
+                    const msg_buf: []u8 = state.allocator.alloc(u8, user.fifo.count);
+                    const n_bytes = user.fifo.read(msg_buf);
+                    if (n_bytes <= user.fifo.count) {
+                        return error{FailedtoRead};
+                    }
+                    try state.in_messages.append(InMessage{ .from = index, .msg = msg_buf });
+                } else {
+                    state.connect = true;
+                }
+            }
+
+            if (poll_out) {
+                // Handle write
+                for (0.., state.out.items) |index_out, out_message| {
+                    if (out_message.to != index) continue;
+                    try user.stream.writeAll(out_message.msg);
+                    try sent_messages.append(index_out);
+                }
+            }
+
+            if (poll_hup or poll_err) {
+                // Handle disconnect
+
+            }
+        }
+
+        // Filter out sent messages from out messages
+        return state;
+    }
+
     pub fn poll(self: *Server, allocator: std.mem.Allocator) !PollInfo {
         var result = PollInfo{
             .new_data = std.ArrayList(usize).init(allocator),
@@ -181,18 +291,15 @@ const Server = struct {
     }
 };
 
-const BroadcastMessage = struct {
-    msg: []const u8,
-    from: ?usize,
-};
-
-const DirectMessage = struct {
+const OutMessage = struct {
     msg: []const u8,
     to: usize,
 };
 
-const MessageTag = enum { broadcast, direct };
-const Message = union(MessageTag) { broadcast: BroadcastMessage, direct: DirectMessage };
+const InMessage = struct {
+    msg: []const u8,
+    from: usize,
+};
 
 // Todo:
 // - Run this on protohackers and probably deal with edge cases: disconnects of non-joined users and the like
@@ -211,7 +318,7 @@ pub fn main() !void {
 
     while (true) {
         var poll_info = try server.poll(allocator);
-        var send_info = std.ArrayList(Message).init(allocator);
+        var send_info = std.ArrayList(OutMessage).init(allocator);
         defer send_info.deinit();
 
         for (poll_info.new_data.items) |index| {
@@ -220,7 +327,7 @@ pub fn main() !void {
                 .server => {
                     const connection = try listener.accept();
                     const new_index = try server.connect(connection.stream);
-                    try send_info.append(Message{ .direct = .{ .msg = "welcome to budget chat. What's your name?\n", .to = new_index } });
+                    try send_info.append(OutMessage{ .direct = .{ .msg = "welcome to budget chat. What's your name?\n", .to = new_index } });
                 },
                 .connected => {
                     var name_buf: [17]u8 = undefined;
@@ -242,7 +349,7 @@ pub fn main() !void {
                     // Send "x has joined the room" to everyone
                     var join_msg = try std.ArrayList(u8).initCapacity(allocator, n_bytes + 23);
                     try std.fmt.format(join_msg.writer(), "* {s} has joined the room\n", .{name_buf[0..n_bytes]});
-                    try send_info.append(Message{ .broadcast = .{ .msg = join_msg.items, .from = index } });
+                    try send_info.append(OutMessage{ .broadcast = .{ .msg = join_msg.items, .from = index } });
 
                     // Send "room contains a, b, c" to joined user
                     var presence_msg = std.ArrayList(u8).init(allocator);
@@ -256,7 +363,7 @@ pub fn main() !void {
                     const user_list = try std.mem.join(allocator, ", ", just_names.items);
 
                     try std.fmt.format(presence_msg.writer(), "* active users are {s}\n", .{user_list});
-                    try send_info.append(Message{ .direct = .{ .msg = presence_msg.items, .to = index } });
+                    try send_info.append(OutMessage{ .direct = .{ .msg = presence_msg.items, .to = index } });
 
                     // Turn user into joined user
                     try server.join(index, name);
@@ -271,17 +378,17 @@ pub fn main() !void {
 
                     var sent_msg = std.ArrayList(u8).init(allocator);
                     try std.fmt.format(sent_msg.writer(), "[{s}] {s}\n", .{ server.users.items[index].name.items, message_buf[0..n_bytes] });
-                    try send_info.append(Message{ .broadcast = .{ .msg = sent_msg.items, .from = index } });
+                    try send_info.append(OutMessage{ .broadcast = .{ .msg = sent_msg.items, .from = index } });
                 },
             }
         }
 
         for (send_info.items) |message| {
             switch (message) {
-                MessageTag.direct => {
+                OutMessageTag.direct => {
                     try server.send(message.direct.to, message.direct.msg);
                 },
-                MessageTag.broadcast => try server.broadcast(message.broadcast.from, message.broadcast.msg),
+                OutMessageTag.broadcast => try server.broadcast(message.broadcast.from, message.broadcast.msg),
             }
         }
 
@@ -298,7 +405,7 @@ pub fn main() !void {
                 .joined => {
                     var msg = std.ArrayList(u8).init(allocator);
                     try std.fmt.format(msg.writer(), "* {s} disconnected\n", .{user.name.items});
-                    try send_info.append(Message{ .broadcast = .{ .from = index, .msg = msg.items } });
+                    try send_info.append(OutMessage{ .broadcast = .{ .from = index, .msg = msg.items } });
                 },
                 else => {},
             }
