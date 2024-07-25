@@ -55,10 +55,8 @@ pub fn main() !void {
         } else {
             const variable = receive_buf[0..n_bytes];
             const value = database.get(variable) orelse "";
-            for (0..10) |_| {
-                const n_sent = try posix.sendto(sockfd, value, 0, &their_address, their_address_len);
-                std.debug.print("Echoed {d} bytes back: {s}\n", .{ n_sent, value });
-            }
+            const n_sent = try posix.sendto(sockfd, value, 0, &their_address, their_address_len);
+            std.debug.print("Echoed {d} bytes back: {s}\n", .{ n_sent, value });
         }
     }
 }
