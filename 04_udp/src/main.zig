@@ -2,7 +2,15 @@ const std = @import("std");
 const posix = std.posix;
 
 pub fn main() !void {
-    var address = try std.net.Address.parseIp4("0.0.0.0", 3491);
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    const allocator = gpa.allocator();
+
+    // var addresses = try std.net.getAddressList(allocator, "fly-global-services", 5000);
+    var addresses = try std.net.getAddressList(allocator, "0.0.0.0", 3491);
+    defer addresses.deinit();
+
+    var address = addresses.addrs[0];
+
     const sockfd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, posix.IPPROTO.UDP);
     defer posix.close(sockfd);
     try posix.setsockopt(sockfd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
@@ -15,8 +23,6 @@ pub fn main() !void {
     var their_address: posix.sockaddr = undefined;
     var their_address_len: posix.socklen_t = @sizeOf(posix.sockaddr);
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    const allocator = gpa.allocator();
     var database = std.StringHashMap([]const u8).init(allocator);
     try database.put("version", "by OmeRikkert");
 
@@ -24,7 +30,7 @@ pub fn main() !void {
     handle_loop: while (true) {
         std.debug.print("Waiting for packet...\n", .{});
         const n_bytes = try posix.recvfrom(sockfd, &receive_buf, 0, &their_address, &their_address_len);
-        std.debug.print("got {any} bytes from {any}: {s}\n", .{ n_bytes, their_address, receive_buf[0..n_bytes] });
+        std.debug.print("got {any} bytes from {s} [{any}] [{s}]\n", .{ n_bytes, their_address.data, receive_buf[0..n_bytes], receive_buf[0..n_bytes] });
 
         var index_var: usize = 0;
         while (index_var < n_bytes) : (index_var += 1) {
@@ -54,7 +60,10 @@ pub fn main() !void {
             }
         } else {
             const variable = receive_buf[0..n_bytes];
+            std.debug.print("Got asked for [{s}], is in database: {any}\n", .{ variable, database.contains(variable) });
             const value = database.get(variable) orelse "";
+
+            std.debug.print("Sending back [{s}] [{any}]\n", .{ value, value });
             const n_sent = try posix.sendto(sockfd, value, 0, &their_address, their_address_len);
             std.debug.print("Echoed {d} bytes back: {s}\n", .{ n_sent, value });
         }
