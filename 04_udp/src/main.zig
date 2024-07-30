@@ -37,7 +37,7 @@ pub fn main() !void {
             if (receive_buf[index_var] == '=') {
                 const variable = receive_buf[0..index_var];
                 const value = receive_buf[index_var + 1 .. n_bytes];
-                std.debug.print("Writing variable {s} to value {s}\n", .{ variable, value });
+                std.debug.print("Writing variable {s} to value {s} (is version: {any})\n", .{ variable, value, std.mem.eql(u8, variable, "version") });
                 if (!std.mem.eql(u8, variable, "version")) {
                     // Allocate memory for variable if needed
                     var variable_buf: []u8 = undefined;
@@ -53,9 +53,6 @@ pub fn main() !void {
 
                     try database.put(variable_buf, value_buf);
                 }
-                // ???? Program doesn't pass first check if this is not sent.
-                const n_sent = try posix.sendto(sockfd, receive_buf[0..n_bytes], 0, &their_address, their_address_len);
-                std.debug.print("Echoed {d} bytes back: {s}\n", .{ n_sent, receive_buf[0..n_sent] });
                 continue :handle_loop;
             }
         } else {
@@ -64,7 +61,10 @@ pub fn main() !void {
             const value = database.get(variable) orelse "";
 
             std.debug.print("Sending back [{s}] [{any}]\n", .{ value, value });
-            const n_sent = try posix.sendto(sockfd, value, 0, &their_address, their_address_len);
+            var msg = std.ArrayList(u8).init(allocator);
+            defer msg.deinit();
+            try std.fmt.format(msg.writer(), "{s}={s}", .{ variable, value });
+            const n_sent = try posix.sendto(sockfd, msg.items, 0, &their_address, their_address_len);
             std.debug.print("Echoed {d} bytes back: {s}\n", .{ n_sent, value });
         }
     }
