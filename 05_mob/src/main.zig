@@ -22,21 +22,13 @@ pub fn rewriteMsg(alloc: std.mem.Allocator, msg: []const u8) !std.ArrayList(u8) 
     } else {
         out.appendSliceAssumeCapacity(msg[slice_start..msg.len]);
     }
+    out.appendSliceAssumeCapacity("\n");
     return out;
-}
-
-pub fn handleMsg(alloc: std.mem.Allocator, server: std.net.Stream, msg: []const u8) !void {
-    // todo: handle response from server
-    // maybe extract the loop for reading or use std.io.GenericReader with ReadUntilDelimiter somehow?
-    std.debug.print("Trying to handle {s}\n", .{msg});
-    const rewritten = try rewriteMsg(alloc, msg);
-    defer rewritten.deinit();
-    std.debug.print("Trying to write {s}\n", .{rewritten.items});
-    try server.writeAll(rewritten.items);
 }
 
 pub fn handleConnection(connection: std.net.Server.Connection) !void {
     defer connection.stream.close();
+    const client = connection.stream;
 
     std.debug.print("connection to server...\n", .{});
     const serverAddress = try std.net.Address.parseIp4("206.189.113.124", 16963);
@@ -44,28 +36,54 @@ pub fn handleConnection(connection: std.net.Server.Connection) !void {
     defer server.close();
     std.debug.print("connected!\n", .{});
 
+    try server.reader().streamUntilDelimiter(client.writer(), '\n', null);
+    _ = try client.write("\n");
+
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
 
     var data = std.ArrayList(u8).init(allocator);
     defer data.deinit();
 
-    var buf: [1024]u8 = undefined;
-    conn: while (true) {
-        std.debug.print("{any}\n", .{connection.address.in});
-        const nBytes = try connection.stream.read(&buf);
-        if (nBytes <= 0) break;
+    while (true) {
+        // Todo: deal with ERR and HUP
+        const events = std.posix.POLL.IN;
+        const server_pollfd = std.posix.pollfd{ .fd = server.handle, .events = events, .revents = 0 };
+        const client_pollfd = std.posix.pollfd{ .fd = client.handle, .events = events, .revents = 0 };
 
-        for (buf[0..nBytes], 0..) |c, i| {
-            if (c == '\n') {
-                try data.appendSlice(buf[0 .. i + 1]); // Include newline
-                try handleMsg(allocator, server, data.items);
-                data.clearRetainingCapacity();
-                try data.appendSlice(buf[i + 1 .. nBytes]);
-                continue :conn;
-            }
+        // Todo: figure out why this doesnt work
+        var pollfds: [2]std.posix.pollfd = .{ server_pollfd, client_pollfd };
+        std.debug.print("polling\n", .{});
+        const n_events = try std.posix.poll(&pollfds, 1000);
+        if (n_events == 0) {
+            std.debug.print("nothing to do\n", .{});
+            continue;
         }
-        try data.appendSlice(buf[0..nBytes]);
+
+        if (server_pollfd.revents & std.posix.POLL.IN > 0) {
+            try server.reader().streamUntilDelimiter(data.writer(), '\n', null);
+            defer data.clearRetainingCapacity();
+            std.debug.print("Got {s} from server\n", .{data.items});
+
+            const rewritten = try rewriteMsg(allocator, data.items);
+            defer rewritten.deinit();
+
+            std.debug.print("Trying to write {s} to client\n", .{rewritten.items});
+            try client.writeAll(rewritten.items);
+            _ = try client.write("\n");
+        }
+        if (client_pollfd.revents & std.posix.POLL.IN > 0) {
+            try client.reader().streamUntilDelimiter(data.writer(), '\n', null);
+            defer data.clearRetainingCapacity();
+            std.debug.print("Got {s} from client\n", .{data.items});
+
+            const rewritten = try rewriteMsg(allocator, data.items);
+            defer rewritten.deinit();
+
+            std.debug.print("Trying to write {s} to server\n", .{rewritten.items});
+            try server.writeAll(rewritten.items);
+            _ = try server.write("\n");
+        }
     }
 }
 
