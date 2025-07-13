@@ -9,10 +9,11 @@ pub fn rewriteMsg(alloc: std.mem.Allocator, msg: []const u8) !std.ArrayList(u8) 
     var slice_start: usize = 0;
     var out = try std.ArrayList(u8).initCapacity(alloc, msg.len);
     for (msg, 0..) |char, i| {
-        if (char != ' ') continue;
+        if (char != ' ' and char != '\n') continue;
 
         if (isBogus(msg[slice_start..i])) {
-            try out.appendSlice("7YWHMfk9JZe0LM0g1ZauHuiSxhI ");
+            try out.appendSlice("7YWHMfk9JZe0LM0g1ZauHuiSxhI");
+            try out.append(char);
         } else {
             try out.appendSlice(msg[slice_start .. i + 1]); // include space
         }
@@ -23,26 +24,56 @@ pub fn rewriteMsg(alloc: std.mem.Allocator, msg: []const u8) !std.ArrayList(u8) 
     } else {
         try out.appendSlice(msg[slice_start..msg.len]);
     }
-    try out.appendSlice("\n");
     return out;
 }
 
-pub fn blockUntilReadyToWrite(stream: std.net.Stream) !void {
-    var pollfds: [1]std.posix.pollfd = .{.{ .fd = stream.handle, .events = poll.OUT, .revents = 0 }};
+pub fn blockUntilReadyToWrite(stream: std.net.Stream, index: usize) !void {
+    var pollfds: [1]std.posix.pollfd = .{.{ .fd = stream.handle, .events = poll.OUT | poll.HUP, .revents = 0 }};
+    print(index, "blocking for write...\n", .{});
     const n_events = try std.posix.poll(&pollfds, -1);
     std.debug.assert(n_events > 0);
+    if (pollfds[0].revents & poll.OUT > 0) {
+        return;
+    } else {
+        std.debug.print("HUNG UP\n", .{});
+        return error.HUNG_UP;
+    }
 }
 
-pub fn blockUntilReadyToReadMultiple(client: std.net.Stream, server: std.net.Stream) ![2]bool {
+const PollEvents = struct {
+    can_read: bool,
+    hung_up: bool,
+    err: bool,
+};
+
+const SocketReadiness = struct {
+    server: PollEvents,
+    client: PollEvents,
+};
+
+pub fn blockUntilReady(client: std.net.Stream, server: std.net.Stream) !SocketReadiness {
+    const events = poll.IN | poll.HUP | poll.ERR;
     var pollfds: [2]std.posix.pollfd = .{
-        .{ .fd = client.handle, .events = poll.IN, .revents = 0 },
-        .{ .fd = server.handle, .events = poll.IN, .revents = 0 },
+        .{ .fd = client.handle, .events = events, .revents = 0 },
+        .{ .fd = server.handle, .events = events, .revents = 0 },
     };
     const n_events = try std.posix.poll(&pollfds, -1);
     std.debug.assert(n_events > 0);
 
-    // client ready, server ready
-    return .{ pollfds[0].revents & poll.IN > 0, pollfds[1].revents & poll.IN > 0 };
+    const revents_c = pollfds[0].revents;
+    const revents_s = pollfds[1].revents;
+    return .{
+        .server = .{
+            .can_read = revents_s & poll.IN > 0,
+            .hung_up = revents_s & poll.HUP > 0,
+            .err = revents_s & poll.ERR > 0,
+        },
+        .client = .{
+            .can_read = revents_c & poll.IN > 0,
+            .hung_up = revents_c & poll.HUP > 0,
+            .err = revents_c & poll.ERR > 0,
+        },
+    };
 }
 
 pub fn print(index: usize, comptime msg: []const u8, params: anytype) void {
@@ -57,9 +88,35 @@ pub fn debugPrint(msg: []const u8, index: usize) !void {
     try std.zig.stringEscape(msg, bw);
 }
 
+const SplitResult = struct {
+    partial: bool,
+    parts: std.ArrayList([]const u8),
+    fn deinit(self: SplitResult) void {
+        self.parts.deinit();
+    }
+};
+
+fn splitMessage(allocator: std.mem.Allocator, msg: []const u8) !SplitResult {
+    var start: usize = 0;
+    var result = std.ArrayList([]const u8).init(allocator);
+    for (msg, 0..) |c, i| {
+        if (c == '\n') {
+            try result.append(msg[start .. i + 1]);
+            start = i + 1;
+        }
+    }
+    if (0 < msg.len and start < msg.len - 1) {
+        try result.append(msg[start..msg.len]);
+    }
+    return .{
+        .partial = start < msg.len,
+        .parts = result,
+    };
+}
+
 pub fn handleConnection(connection: std.net.Server.Connection, index: usize) !void {
     const client = connection.stream;
-    defer connection.stream.close();
+    defer client.close();
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     const allocator = gpa.allocator();
@@ -75,69 +132,105 @@ pub fn handleConnection(connection: std.net.Server.Connection, index: usize) !vo
     defer server.close();
     print(index, "connected!\n", .{});
 
-    var data_server = std.ArrayList(u8).init(allocator);
-    defer data_server.deinit();
-    var data_client = std.ArrayList(u8).init(allocator);
-    defer data_client.deinit();
+    var server_in: [4096]u8 = undefined;
+    var start_server: usize = 0;
+    var end_server: usize = 0;
 
-    var connected = true;
+    var client_in: [4096]u8 = undefined;
+    var start_client: usize = 0;
+    var end_client: usize = 0;
+
+    const connected = true;
     var i: usize = 0;
     while (connected) : (i += 1) {
-        // Todo: deal with ERR and HUP
-        const ready = try blockUntilReadyToReadMultiple(client, server);
-        const ready_client = ready[0];
-        const ready_server = ready[1];
+        print(index, "blocking until ready\n", .{});
+        const ready = try blockUntilReady(client, server);
+
+        if (ready.server.hung_up or ready.server.err) {
+            print(index, "server hung up or err\n", .{});
+            break;
+        }
+        if (ready.client.hung_up or ready.client.err) {
+            print(index, "client hung up or err\n", .{});
+            break;
+        }
 
         // Fetch data
-        if (ready_server) {
+        var n_read_server: usize = 0;
+        if (ready.server.can_read) {
             print(index, "server is ready!\n", .{});
-            data_server.clearRetainingCapacity();
-            server.reader().streamUntilDelimiter(data_server.writer(), '\n', null) catch |err| switch (err) {
-                error.EndOfStream => {
-                    print(index, "server end of stream\n", .{});
-                },
-                else => return err,
-            };
-            try debugPrint(data_server.items, index);
-            std.debug.print(" is what we got from the server (len {})\n", .{data_server.items.len});
+            n_read_server = try server.read(server_in[start_server..]);
+            print(index, "read {} bytes\n", .{n_read_server});
+            end_server = start_server + n_read_server;
+            try debugPrint(server_in[0..n_read_server], index);
+            std.debug.print(" is what we got from the server (len {})\n", .{server_in.len});
         }
 
-        if (ready_client) {
+        var n_read_client: usize = 0;
+        if (ready.client.can_read) {
             print(index, "client is ready!\n", .{});
-            data_client.clearRetainingCapacity();
-            client.reader().streamUntilDelimiter(data_client.writer(), '\n', null) catch |err| switch (err) {
-                error.EndOfStream => {
-                    connected = false;
-                    print(index, "client end of stream\n", .{});
-                },
-                else => return err,
-            };
-            try debugPrint(data_client.items, index);
-            std.debug.print(" is what we got from the client (len {})\n", .{data_client.items.len});
+            n_read_client = try client.read(client_in[start_client..]);
+            print(index, "read {} bytes\n", .{n_read_client});
+            end_client = start_client + n_read_client;
+            try debugPrint(client_in[0..n_read_client], index);
+            std.debug.print(" is what we got from the client (len {})\n", .{client_in.len});
         }
+
+        if (start_client + n_read_client == 0 and start_server + n_read_server == 0) break;
 
         // Write data
-        if (ready_server and data_server.items.len > 0) {
-            try blockUntilReadyToWrite(client);
-            const rewritten_server = try rewriteMsg(allocator, data_server.items);
-            defer rewritten_server.deinit();
+        if (ready.server.can_read and server_in.len > 0) {
+            var split_result = try splitMessage(allocator, server_in[0..end_server]);
+            defer split_result.deinit();
 
-            try debugPrint(rewritten_server.items, index);
-            std.debug.print(" is what we tried to write to the client\n", .{});
-            try client.writeAll(rewritten_server.items);
+            if (split_result.partial) {
+                const partial = split_result.parts.pop() orelse "";
+                if (partial.len != start_server) @memcpy(server_in[0..partial.len], partial);
+                start_server = partial.len;
+            } else {
+                start_server = 0;
+            }
+
+            try blockUntilReadyToWrite(client, index);
+            for (split_result.parts.items) |msg| {
+                const rewritten_server = try rewriteMsg(allocator, msg);
+                defer rewritten_server.deinit();
+
+                try debugPrint(rewritten_server.items, index);
+                std.debug.print(" is what we try to write to the client\n", .{});
+                try client.writeAll(rewritten_server.items);
+                try debugPrint(rewritten_server.items, index);
+                std.debug.print(" is what we wrote to the client\n", .{});
+            }
         }
 
-        if (ready_client and data_client.items.len > 0) {
-            try blockUntilReadyToWrite(server);
-            const rewritten_client = try rewriteMsg(allocator, data_client.items);
-            defer rewritten_client.deinit();
+        if (ready.client.can_read and client_in.len > 0) {
+            var split_result = try splitMessage(allocator, client_in[0..end_client]);
+            defer split_result.deinit();
 
-            try debugPrint(rewritten_client.items, index);
-            std.debug.print(" is what we tried to write to the server\n", .{});
-            // print(index, "Trying to write {s} to server\n", .{std.fmt.fmt rewritten_client.items});
-            try server.writeAll(rewritten_client.items);
+            if (split_result.partial) {
+                const partial = split_result.parts.pop() orelse "";
+                // todo: partial is overwriting itself here because it doesn't ahve a full message
+                if (partial.len != start_server) @memcpy(server_in[0..partial.len], partial);
+                start_client = partial.len;
+            } else {
+                start_client = 0;
+            }
+
+            try blockUntilReadyToWrite(client, index);
+            for (split_result.parts.items) |msg| {
+                const rewritten_client = try rewriteMsg(allocator, msg);
+                defer rewritten_client.deinit();
+
+                try debugPrint(rewritten_client.items, index);
+                std.debug.print(" is what we try to write to the server\n", .{});
+                try server.writeAll(rewritten_client.items);
+                try debugPrint(rewritten_client.items, index);
+                std.debug.print(" is what we wrote to the server\n", .{});
+            }
         }
     }
+    print(index, "closing....\n", .{});
 }
 
 pub fn main() !void {
@@ -172,5 +265,6 @@ test "test rewriteMsg" {
     defer msg.deinit();
 
     try checkRewriteMsg("Hi alice, please send payment to 7iKDZEwPZSqIvDnHvVN2r0hUWXD5rHX", "Hi alice, please send payment to 7YWHMfk9JZe0LM0g1ZauHuiSxhI");
+    try checkRewriteMsg("[BlueDev728] Please send the payment of 750 Boguscoins to 7iA9Z0sXdw9j6QKFdPLyHxZi2mXKXaODem5\n", "[BlueDev728] Please send the payment of 750 Boguscoins to 7YWHMfk9JZe0LM0g1ZauHuiSxhI\n");
     try checkRewriteMsg("* The room contains: alice", "* The room contains: alice");
 }
