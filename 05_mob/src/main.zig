@@ -97,6 +97,7 @@ const SplitResult = struct {
 };
 
 fn splitMessage(allocator: std.mem.Allocator, msg: []const u8) !SplitResult {
+    std.debug.print("{s} is what we're trying to split\n", .{msg});
     var start: usize = 0;
     var result = std.ArrayList([]const u8).init(allocator);
     for (msg, 0..) |c, i| {
@@ -105,8 +106,12 @@ fn splitMessage(allocator: std.mem.Allocator, msg: []const u8) !SplitResult {
             start = i + 1;
         }
     }
-    if (0 < msg.len and start < msg.len - 1) {
+    if (start < msg.len) {
         try result.append(msg[start..msg.len]);
+    }
+
+    for (result.items) |part| {
+        std.debug.print("{s} is a part\n", .{part});
     }
     return .{
         .partial = start < msg.len,
@@ -183,9 +188,14 @@ pub fn handleConnection(connection: std.net.Server.Connection, index: usize) !vo
             var split_result = try splitMessage(allocator, server_in[0..end_server]);
             defer split_result.deinit();
 
+            for (split_result.parts.items, 0..) |part, j| {
+                try debugPrint(part, index);
+                std.debug.print(" is server part {any}\n", .{j});
+            }
+
             if (split_result.partial) {
                 const partial = split_result.parts.pop() orelse "";
-                if (partial.len != start_server) @memcpy(server_in[0..partial.len], partial);
+                std.mem.copyForwards(u8, server_in[0..partial.len], partial);
                 start_server = partial.len;
             } else {
                 start_server = 0;
@@ -208,10 +218,15 @@ pub fn handleConnection(connection: std.net.Server.Connection, index: usize) !vo
             var split_result = try splitMessage(allocator, client_in[0..end_client]);
             defer split_result.deinit();
 
+            for (split_result.parts.items, 0..) |part, j| {
+                try debugPrint(part, index);
+                std.debug.print(" is client part {any}\n", .{j});
+            }
             if (split_result.partial) {
                 const partial = split_result.parts.pop() orelse "";
-                // todo: partial is overwriting itself here because it doesn't ahve a full message
-                if (partial.len != start_server) @memcpy(server_in[0..partial.len], partial);
+                try debugPrint(partial, index);
+                std.debug.print(" is what we partially have\n", .{});
+                std.mem.copyForwards(u8, client_in[0..partial.len], partial);
                 start_client = partial.len;
             } else {
                 start_client = 0;
